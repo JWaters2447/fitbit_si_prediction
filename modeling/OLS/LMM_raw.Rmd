@@ -1,0 +1,659 @@
+```{r, warning=False, message=False}
+library(tidyverse)      # data wrangling and plotting
+library(readr)          # read in tsv files
+library(caret)          # train test split
+library(ComplexHeatmap) # View model performance
+library(circlize)       # colors for heatmaps
+library(iml)            # shap importance scores
+```
+
+# Load Data
+```{r, warning=False, message=False}
+total_data <- read_tsv("../../data/cleaned/combined_data_cleaned.tsv", show_col_types = F)
+```
+
+# Generate Date:
+```{r}
+
+# total_data %>% colnames()
+
+survey_columns <- my_vars <- c(
+  "Race",
+  "isHispanic",
+  "Relationship_Status",
+  "education",
+  "employment",
+  "sex",
+  "gender",
+  "sexuality",
+  "SI_max",
+  "SI_mean",
+  "age"
+)
+
+
+survey_only <- total_data[!duplicated(total_data$PatientID), c("PatientID", survey_columns)]
+fitbit_only <- total_data[, c(setdiff(colnames(total_data), survey_columns), "SI_mean", "SI_max")]
+```
+
+# Get aggregates
+```{r, warning=FALSE}
+
+# SD aggregates
+fitbit_only_agg_sd <- fitbit_only %>%
+  group_by(PatientID) %>%  # Group by PatientID
+  summarise(
+    across(c(SI_mean, SI_max), first),
+    across(-c(SI_mean, SI_max), sd, na.rm = TRUE),  # Compute SD for all other columns
+    .groups = "drop"  # Drop grouping after summarization
+  ) %>% select(-PatientID) # Drop PatientID
+
+total_only_agg_sd <- total_data %>%
+  group_by(PatientID) %>%  # Group by PatientID
+  summarise(
+    across(survey_columns, first),
+    across(-c(survey_columns), sd, na.rm = TRUE),  # Compute SD for all other columns
+    .groups = "drop"  # Drop grouping after summarization
+  ) %>% select(-PatientID) # Drop PatientID
+
+# Mean Aggregates
+fitbit_only_agg_mean <- fitbit_only %>%
+  group_by(PatientID) %>%  # Group by PatientID
+  summarise(
+    across(c(SI_mean, SI_max), first),
+    across(-c(SI_mean, SI_max), mean, na.rm = TRUE),  # Compute mean for all other columns
+    .groups = "drop"  # Drop grouping after summarization
+  ) %>% select(-PatientID) # Drop PatientID
+
+total_only_agg_mean <- total_data %>%
+  group_by(PatientID) %>%  # Group by PatientID
+  summarise(
+    across(survey_columns, first),
+    across(-c(survey_columns), mean, na.rm = TRUE),  # Compute mean for all other columns
+    .groups = "drop"  # Drop grouping after summarization
+  ) %>% select(-PatientID) # Drop PatientID
+
+survey_only <- survey_only %>% select(-PatientID)
+```
+
+
+# Build Raw
+```{r}
+raw_regression <- function(df, target, weights = NULL) {
+
+  # Set seed for reproducibility
+  set.seed(123)
+  
+  # Create a stratified partition based on the target variable
+  train_index <- createDataPartition(df[[target]], p = 0.7, list = FALSE)
+  train_data <- df[train_index, ]
+  test_data  <- df[-train_index, ]
+  
+  # If weights are provided, validate and subset to match train_data
+  if (!is.null(weights)) {
+    if (!is.numeric(weights) || length(weights) != nrow(df)) {
+      stop("weights must be a numeric vector of the same length as the input dataframe")
+    }
+    weights_vector <- weights[train_index]
+  }
+  
+  # Create formula
+  formula <- as.formula(paste(target, "~ ."))
+  
+  # Fit model with or without weights
+  model <- if (!is.null(weights)) {
+    lm(formula, data = train_data, weights = weights_vector)
+  } else {
+    lm(formula, data = train_data)
+  }
+  
+  # Predictions
+  pred_train <- predict(model, newdata = train_data)
+  pred_test  <- predict(model, newdata = test_data)
+  
+  # Overall RMSE
+  rmse_train_total <- sqrt(mean((train_data[[target]] - pred_train)^2))
+  rmse_test_total  <- sqrt(mean((test_data[[target]] - pred_test)^2))
+  
+  # Per-level RMSE (for levels 1–5 only)
+  levels_vec <- c(1, 2, 3, 4, 5)
+  rmse_train_levels <- numeric(length(levels_vec))
+  rmse_test_levels  <- numeric(length(levels_vec))
+  
+  for (i in seq_along(levels_vec)) {
+    level_val <- levels_vec[i]
+    train_idx <- which(train_data[[target]] == level_val)
+    test_idx  <- which(test_data[[target]] == level_val)
+    rmse_train_levels[i] <- sqrt(mean((train_data[[target]][train_idx] - pred_train[train_idx])^2))
+    rmse_test_levels[i]  <- sqrt(mean((test_data[[target]][test_idx] - pred_test[test_idx])^2))
+  }
+  
+  # RMSE matrix
+  results_mat <- rbind(
+    train = c(rmse_train_levels, total = rmse_train_total),
+    test  = c(rmse_test_levels,  total = rmse_test_total)
+  )
+  rownames(results_mat) <- c("Train", "Test")
+  colnames(results_mat) <- c("1", "2", "3", "4", "5", "Total")
+  
+  # SHAP via iml
+  X_train <- train_data[, !(names(train_data) %in% target), drop = FALSE]
+  predictor <- Predictor$new(model, data = X_train, y = train_data[[target]])
+  shapley <- Shapley$new(predictor, x.interest = X_train[1, ])
+  shap_values <- shapley$results
+  
+  return(list(
+    model_summary = summary(model),
+    RMSE = round(results_mat, 2),
+    SHAP = shap_values
+  ))
+}
+```
+
+# Calculate sample weights
+```{r}
+estimate_continuous_weights <- function(df, target, bw = "nrd0") {
+  d <- density(df[[target]], bw = bw)
+  # Interpolate densities for each observation
+  density_est <- approx(d$x, d$y, xout = df[[target]])$y
+  # Inverse density as weight
+  weights <- 1 / density_est
+  # Normalize
+  weights <- weights / mean(weights)
+  return(weights)
+}
+
+SI_mean_weights <- estimate_continuous_weights(total_only_agg_mean, "SI_mean")
+```
+
+
+# Generate models & shap scores
+```{r}
+fitbit_sd_out   <- raw_regression(fitbit_only_agg_sd %>% select(-SI_max), "SI_mean")
+fitbit_mean_out <- raw_regression(fitbit_only_agg_mean %>% select(-SI_max), "SI_mean")
+survey_out      <- raw_regression(survey_only %>% select(-SI_max), "SI_mean")
+total_sd_out    <- raw_regression(total_only_agg_sd %>% select(-SI_max), "SI_mean")
+total_mean_out  <- raw_regression(total_only_agg_mean %>% select(-SI_max), "SI_mean")
+
+
+# Combine them into a list
+results_list <- list(
+  fitbit_sd   = fitbit_sd_out,
+  fitbit_mean = fitbit_mean_out,
+  survey      = survey_out,
+  total_sd    = total_sd_out,
+  total_mean  = total_mean_out
+)
+
+results_list$fitbit_mean$RMSE
+
+combined_mat <- rbind(
+  results_list$fitbit_sd$RMSE,
+  results_list$fitbit_mean$RMSE,
+  results_list$survey$RMSE,
+  results_list$total_sd$RMSE,
+  results_list$total_mean$RMSE
+)
+```
+```{r}
+fitbit_sd_out   <- raw_regression(fitbit_only_agg_sd %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+fitbit_mean_out <- raw_regression(fitbit_only_agg_mean %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+survey_out      <- raw_regression(survey_only %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+total_sd_out    <- raw_regression(total_only_agg_sd %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+total_mean_out  <- raw_regression(total_only_agg_mean %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+
+
+# Combine them into a list
+results_list_weighted <- list(
+  fitbit_sd   = fitbit_sd_out,
+  fitbit_mean = fitbit_mean_out,
+  survey      = survey_out,
+  total_sd    = total_sd_out,
+  total_mean  = total_mean_out
+)
+
+# Construct the combined matrix by row-binding the "MAE" matrices from each list element.
+combined_mat_weighted <- rbind(
+  results_list_weighted$fitbit_sd$RMSE,
+  results_list_weighted$fitbit_mean$RMSE,
+  results_list_weighted$survey$RMSE,
+  results_list_weighted$total_sd$RMSE,
+  results_list_weighted$total_mean$RMSE
+)
+
+
+```
+
+# Elastic net
+```{r}
+elastic_net_regression <- function(df, target, weights = NULL) {
+  # Set seed for reproducibility
+  set.seed(123)
+  
+  # Stratify based on the rounded target (e.g., SI_mean rounded to whole numbers)
+  strata <- round(df[[target]])
+  train_index <- createDataPartition(strata, p = 0.7, list = FALSE)
+  train_data <- df[train_index, ]
+  test_data  <- df[-train_index, ]
+  
+  # If weights are provided, validate and subset to match train_data
+  if (!is.null(weights)) {
+    if (!is.numeric(weights) || length(weights) != nrow(df)) {
+      stop("weights must be a numeric vector of the same length as the input dataframe")
+    }
+    weights_vector <- weights[train_index]
+  }
+  
+  # Create formula for modeling
+  formula <- as.formula(paste(target, "~ ."))
+  
+  # Set up 5-fold cross-validation
+  train_control <- trainControl(method = "cv", number = 5)
+  
+  # Define a tuning grid for alpha and lambda.
+  # alpha varies from 0 (ridge) to 1 (lasso); lambda is on a log scale.
+  tune_grid <- expand.grid(alpha = seq(0, 1, by = 0.1),
+                           lambda = 10^seq(-3, 1, length = 100))
+  
+  # Fit elastic net model via caret, passing weights if provided.
+  if (!is.null(weights)) {
+    enet_model <- train(formula,
+                        data = train_data,
+                        method = "glmnet",
+                        trControl = train_control,
+                        tuneGrid = tune_grid,
+                        weights = weights_vector)
+  } else {
+    enet_model <- train(formula,
+                        data = train_data,
+                        method = "glmnet",
+                        trControl = train_control,
+                        tuneGrid = tune_grid)
+  }
+  
+  # Extract the best tuning parameters and corresponding CV performance
+  best_params <- enet_model$bestTune
+  best_result <- enet_model$results[enet_model$results$alpha == best_params$alpha & 
+                                      enet_model$results$lambda == best_params$lambda, ]
+  cv_rmse_mean <- best_result$RMSE
+  cv_rmse_sd   <- best_result$RMSESD
+  
+  # Predictions on training and test data using the best model
+  pred_train <- predict(enet_model, newdata = train_data)
+  pred_test  <- predict(enet_model, newdata = test_data)
+  
+  # Compute overall RMSE for training and test sets
+  rmse_train_total <- sqrt(mean((train_data[[target]] - pred_train)^2))
+  rmse_test_total  <- sqrt(mean((test_data[[target]] - pred_test)^2))
+  
+  # Compute per-level RMSE for levels 1–5 based on rounded target values
+  levels_vec <- c(1, 2, 3, 4, 5)
+  rmse_train_levels <- numeric(length(levels_vec))
+  rmse_test_levels  <- numeric(length(levels_vec))
+  
+  for (i in seq_along(levels_vec)) {
+    level_val <- levels_vec[i]
+    # Use the rounded values for grouping
+    train_idx <- which(round(train_data[[target]]) == level_val)
+    test_idx  <- which(round(test_data[[target]]) == level_val)
+    
+    # Check if there are observations for the current level
+    rmse_train_levels[i] <- if (length(train_idx) > 0) {
+      sqrt(mean((train_data[[target]][train_idx] - pred_train[train_idx])^2))
+    } else {
+      NA
+    }
+    rmse_test_levels[i] <- if (length(test_idx) > 0) {
+      sqrt(mean((test_data[[target]][test_idx] - pred_test[test_idx])^2))
+    } else {
+      NA
+    }
+  }
+  
+  # Create RMSE matrix
+  results_mat <- rbind(
+    train = c(rmse_train_levels, total = rmse_train_total),
+    test  = c(rmse_test_levels,  total = rmse_test_total)
+  )
+  rownames(results_mat) <- c("Train", "Test")
+  colnames(results_mat) <- c("1", "2", "3", "4", "5", "Total")
+  
+  # SHAP analysis via iml on the training set predictors (excluding the target)
+  X_train <- train_data[, !(names(train_data) %in% target), drop = FALSE]
+  predictor_obj <- Predictor$new(enet_model, data = X_train, y = train_data[[target]])
+  shapley <- Shapley$new(predictor_obj, x.interest = X_train[1, ])
+  shap_values <- shapley$results
+  
+  # Return a list including the model, RMSE breakdown, SHAP values, and CV performance
+  return(list(
+    model_summary = enet_model,  # caret model object with bestTune and performance info
+    RMSE = round(results_mat, 2),
+    SHAP = shap_values,
+    cv_rmse_mean = cv_rmse_mean,
+    cv_rmse_sd = cv_rmse_sd
+  ))
+}
+
+
+```
+
+# Unweighted elastic net
+```{r}
+fitbit_sd_out   <- elastic_net_regression(fitbit_only_agg_sd %>% select(-SI_max), "SI_mean")
+fitbit_mean_out <- elastic_net_regression(fitbit_only_agg_mean %>% select(-SI_max), "SI_mean")
+survey_out      <- elastic_net_regression(survey_only %>% select(-SI_max), "SI_mean")
+total_sd_out    <- elastic_net_regression(total_only_agg_sd %>% select(-SI_max), "SI_mean")
+total_mean_out  <- elastic_net_regression(total_only_agg_mean %>% select(-SI_max), "SI_mean")
+
+
+# Combine them into a list
+results_list_elastic <- list(
+  fitbit_sd   = fitbit_sd_out,
+  fitbit_mean = fitbit_mean_out,
+  survey      = survey_out,
+  total_sd    = total_sd_out,
+  total_mean  = total_mean_out
+)
+
+# Construct the combined matrix by row-binding the "MAE" matrices from each list element.
+combined_mat_elastic <- rbind(
+  results_list_elastic$fitbit_sd$RMSE,
+  results_list_elastic$fitbit_mean$RMSE,
+  results_list_elastic$survey$RMSE,
+  results_list_elastic$total_sd$RMSE,
+  results_list_elastic$total_mean$RMSE
+)
+
+elastic_net_mean <- c(
+  results_list_elastic$fitbit_sd$cv_rmse_mean,
+  results_list_elastic$fitbit_mean$cv_rmse_mean,
+  results_list_elastic$survey$cv_rmse_mean,
+  results_list_elastic$total_sd$cv_rmse_mean,
+  results_list_elastic$total_mean$cv_rmse_mean
+)
+
+elastic_net_sd <- c(
+  results_list_elastic$fitbit_sd$cv_rmse_sd,
+  results_list_elastic$fitbit_mean$cv_rmse_sd,
+  results_list_elastic$survey$cv_rmse_sd,
+  results_list_elastic$total_sd$cv_rmse_sd,
+  results_list_elastic$total_mean$cv_rmse_sd
+)
+
+```
+
+# Weighted elastic net
+```{r}
+fitbit_sd_out   <- elastic_net_regression(fitbit_only_agg_sd %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+fitbit_mean_out <- elastic_net_regression(fitbit_only_agg_mean %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+survey_out      <- elastic_net_regression(survey_only %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+total_sd_out    <- elastic_net_regression(total_only_agg_sd %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+total_mean_out  <- elastic_net_regression(total_only_agg_mean %>% select(-SI_max), "SI_mean", weights=SI_mean_weights)
+
+
+# Combine them into a list
+results_list_elastic_weighted <- list(
+  fitbit_sd   = fitbit_sd_out,
+  fitbit_mean = fitbit_mean_out,
+  survey      = survey_out,
+  total_sd    = total_sd_out,
+  total_mean  = total_mean_out
+)
+
+# Construct the combined matrix by row-binding the "MAE" matrices from each list element.
+combined_mat_elastic_weighted <- rbind(
+  results_list_elastic_weighted$fitbit_sd$RMSE,
+  results_list_elastic_weighted$fitbit_mean$RMSE,
+  results_list_elastic_weighted$survey$RMSE,
+  results_list_elastic_weighted$total_sd$RMSE,
+  results_list_elastic_weighted$total_mean$RMSE
+)
+
+elastic_net_mean_weighted <- c(
+  results_list_elastic_weighted$fitbit_sd$cv_rmse_mean,
+  results_list_elastic_weighted$fitbit_mean$cv_rmse_mean,
+  results_list_elastic_weighted$survey$cv_rmse_mean,
+  results_list_elastic_weighted$total_sd$cv_rmse_mean,
+  results_list_elastic_weighted$total_mean$cv_rmse_mean
+)
+
+elastic_net_sd_weighted <- c(
+  results_list_elastic_weighted$fitbit_sd$cv_rmse_sd,
+  results_list_elastic_weighted$fitbit_mean$cv_rmse_sd,
+  results_list_elastic_weighted$survey$cv_rmse_sd,
+  results_list_elastic_weighted$total_sd$cv_rmse_sd,
+  results_list_elastic_weighted$total_mean$cv_rmse_sd
+)
+
+```
+
+
+# Plotting modeling performace
+```{r}
+make_heatmap_from_matrix <- function(combined_mat, main_group, sub_group, column_title, file_name,
+                                       group_fontface = "bold", group_fontsize = 12,
+                                       row_names_fontface = "bold", row_names_fontsize = 14,
+                                       cell_text_fontsize = 12, 
+                                       top_anno_fontsize = 10,
+                                       legend_fontsize = 13,
+                                       group_stats = NULL) {
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  
+  # Check that grouping vectors match the number of rows.
+  if(length(main_group) != nrow(combined_mat)) {
+    stop("Length of main_group must equal the number of rows in combined_mat.")
+  }
+  if(length(sub_group) != nrow(combined_mat)) {
+    stop("Length of sub_group must equal the number of rows in combined_mat.")
+  }
+  
+  # If group_stats is provided, update main_group labels.
+  # Expect group_stats to be a data.frame with columns: "group", "mean", "sd"
+  if(!is.null(group_stats)) {
+    required_cols <- c("group", "mean", "sd")
+    if(!all(required_cols %in% colnames(group_stats))) {
+      stop("group_stats must have columns: group, mean, and sd")
+    }
+    # Create formatted labels for each unique group.
+    formatted_labels <- setNames(
+      paste0(group_stats$group, ", mean\n(", 
+             sprintf("%.2f", group_stats$mean), " ± ", sprintf("%.2f", group_stats$sd), ")"),
+      group_stats$group
+    )
+    # Update main_group: look up the formatted label.
+    main_group <- formatted_labels[as.character(main_group)]
+  }
+  
+  # Create hierarchical row splits.
+  row_split_list <- list(
+    Main = factor(main_group),
+    Agg  = factor(sub_group)
+  )
+  
+  # Use the column names of combined_mat for annotation.
+  col_names <- colnames(combined_mat)
+  if(is.null(col_names)) {
+    stop("combined_mat must have column names.")
+  }
+  
+  # Set default column colors.
+  if(length(col_names) == 6) {
+    col_colors <- c("blue", "green", "yellow", "orange", "red", "gray")
+  } else {
+    col_colors <- rainbow(length(col_names))
+  }
+  names(col_colors) <- col_names
+  
+  # Create a top column annotation with label "SI_mean"
+  col_anno <- HeatmapAnnotation(
+    SI_mean = col_names,
+    col = list(SI_mean = col_colors),
+    border = TRUE,
+    annotation_legend_param = list(SI_mean = list(
+      title = "SI_mean", 
+      at = col_names, 
+      labels = col_names,
+      title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+      labels_gp = gpar(fontsize = legend_fontsize)
+    )),
+    annotation_name_gp = gpar(fontsize = 13, fontface = "bold")
+  )
+  
+  # Create a color mapping function for the heatmap that fixes the range 0-5 with 3 at center.
+  col_fun <- colorRamp2(c(0, 3, 5), c("blue", "white", "red"))
+  
+  # Helper function: Determine contrasting text color based on background brightness.
+  get_contrast_color <- function(bg) {
+    rgb <- col2rgb(bg)
+    brightness <- (0.299 * rgb[1] + 0.587 * rgb[2] + 0.114 * rgb[3])
+    if(brightness < 80) "white" else "black"
+  }
+  
+  # Build the heatmap.
+  ht <- Heatmap(
+    combined_mat,
+    name = "Metric",
+    col = col_fun,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_names_gp = gpar(fontface = row_names_fontface, fontsize = row_names_fontsize),
+    show_column_names = FALSE,  # Hide default column names.
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    rect_gp = gpar(col = "black", lwd = 1),  # Black borders around cells.
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      contrast_color <- get_contrast_color(fill)
+      grid.text(sprintf("%.2f", combined_mat[i, j]), x, y, 
+                gp = gpar(col = contrast_color, fontsize = cell_text_fontsize))
+    },
+    row_split = row_split_list,
+    row_title_side = "left",  # Row split labels on the left.
+    row_title_rot = 0,        # Horizontal row split labels.
+    row_title_gp = gpar(fontface = group_fontface, fontsize = group_fontsize),
+    top_annotation = col_anno,
+    column_title = column_title,
+    border_gp = gpar(col = "black"),
+    column_title_gp = gpar(fontsize = 16, fontface = "bold"),
+    heatmap_legend_param = list(
+      title = "RMSE", 
+      at = c(0, 1, 2, 3, 4, 5),
+      labels = c(0, 1, 2, 3, 4, 5),
+      title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+      labels_gp = gpar(fontsize = legend_fontsize)
+    )
+  )
+  
+  # Save or draw the heatmap.
+  # Uncomment below to save as PNG:
+  # png(file_name, width = 1200, height = 1000, res = 150)
+  draw(ht, heatmap_legend_side = "right", merge_legend = TRUE)
+  # dev.off()
+}
+
+
+
+# Example grouping vectors:
+main_group <- c(rep("fitbit", 4), rep("survey", 2), rep("total", 4))
+sub_group  <- c("sd", "sd", "mean", "mean", "survey", "survey", "sd", "sd", "mean", "mean")
+
+# Set plot title and file path.
+column_title <- "Raw Linear Regression RMSE"
+file_name <- "../../figures/modeling/OLS/raw/raw_LR_RMSE_heatmap.png"
+
+# Example grouping vectors:
+main_group <- c(rep("fitbit", 4), rep("survey", 2), rep("total", 4))
+sub_group  <- c("sd", "sd", "mean", "mean", "survey", "survey", "sd", "sd", "mean", "mean")
+
+# Set plot title and file path.
+column_title <- "Raw Linear Regression RMSE"
+file_name <- "../../figures/modeling/OLS/raw/raw_LR_RMSE_heatmap.png"
+
+# Generate and save the heatmap.
+make_heatmap_from_matrix(combined_mat, main_group, sub_group, column_title, file_name)
+
+# Set plot title and file path.
+column_title <- "Raw Linear Regression RMSE weighted"
+file_name <- "../../figures/modeling/OLS/raw/raw_LR_RMSE_weighted_heatmap.png"
+
+make_heatmap_from_matrix(combined_mat_weighted, main_group, sub_group, column_title, file_name)
+
+# Set plot title and file path.
+column_title <- "Elastic Net Regression RMSE"
+file_name <- "../../figures/modeling/OLS/raw/elastic_LR_RMSE_heatmap.png"
+
+make_heatmap_from_matrix(combined_mat_elastic, main_group, sub_group, column_title, file_name)
+
+
+# Set plot title and file path.
+column_title <- "Elastic Net Linear Regression RMSE weighted"
+file_name <- "../../figures/modeling/OLS/raw/elastic_LR_RMSE_weighted_heatmap.png"
+
+make_heatmap_from_matrix(combined_mat_elastic_weighted, main_group, sub_group, column_title, file_name, group_means = elastic_net_mean_weighted, group_sds = elastic_net_sd_weighted)
+
+
+```
+
+
+
+
+# Plot SHAP scores
+```{r, fig.width=8, fight.height=8}
+generate_shap_forest_plot <- function(raw_output, plot_title, positive_only = FALSE) {
+  # Extract the SHAP results from the raw_regression output.
+  # Expected columns: feature, phi, phi.var, feature.value
+  shap_df <- raw_output$SHAP
+  
+  # Compute the standard error (assuming phi.var contains variance)
+  shap_df$se <- sqrt(shap_df$phi.var)
+  
+  # If positive_only is TRUE, filter the data for only positive phi values.
+  if (positive_only) {
+    shap_df <- shap_df[shap_df$phi > 0, ]
+  }
+  
+  # Order the data frame by phi (highest to lowest)
+  shap_df <- shap_df[order(shap_df$phi, decreasing = TRUE), ]
+  
+  # Reverse factor levels so that the highest phi appears at the top in the plot.
+  shap_df$feature <- factor(shap_df$feature, levels = rev(shap_df$feature))
+  
+  # Create the plot title by appending the appropriate suffix.
+  full_title <- paste0(plot_title, if (positive_only) " Positive SHAP Scores" else " SHAP Scores")
+  
+  # Create the forest plot using ggplot2 with a white background.
+  p <- ggplot(shap_df, aes(x = phi, y = feature)) +
+    geom_point(size = 3) +
+    geom_errorbarh(aes(xmin = phi - se, xmax = phi + se), height = 0.2) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+    labs(title = full_title,
+         x = "SHAP value (phi)",
+         y = "Feature") +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+      axis.title.x = element_text(face = "bold", size = 12),
+      axis.title.y = element_text(face = "bold", size = 12),
+      axis.text.y  = element_text(face = "bold", size = 10),
+      axis.text.x = element_text(size = 12)
+    )
+  
+  # Construct the file path (save in the same location as the heatmap)
+  file_path <- file.path("../../figures/modeling/OLS/raw", paste0(plot_title, "_SHAPS", ".png"))
+  
+  print(p)
+  # Save the plot to file with the white background.
+  ggsave(filename = file_path, plot = p, width = 8, height = 8, dpi = 300)
+}
+
+
+
+
+# generate_shap_forest_plot(fitbit_sd_out, "fitbit_sd")
+# generate_shap_forest_plot(fitbit_mean_out, "fitbit_sd")
+# generate_shap_forest_plot(survey_out, "survey")
+# generate_shap_forest_plot(total_sd_out, "total_sd")
+generate_shap_forest_plot(total_mean_out, "total_mean", positive_only = T)
+```
+

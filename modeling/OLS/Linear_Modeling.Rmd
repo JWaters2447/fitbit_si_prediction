@@ -1,0 +1,1374 @@
+```{r, warning=False, message=False}
+library(tidyverse)      # data wrangling and plotting
+library(readr)          # read in tsv files
+library(caret)          # train test split
+library(ComplexHeatmap) # View model performance
+library(circlize)       # colors for heatmaps
+library(fastshap)            # shap importance scores
+library(pROC)           # ROC
+library(glmnet)         # elastic net
+library(doParallel)
+cl <- makeCluster(24)    # ncores is the number of cores to use
+registerDoParallel(cl)
+
+```
+
+# Helper functions for preprocessing loaded data
+```{r}
+remove_vars <- function(data) {
+  # Identify columns to remove: "timepoints" or any name that contains "outcome" (ignoring case)
+  cols_to_remove <- (names(data) == "timepoints") | grepl("outcome", names(data), ignore.case = TRUE)
+  
+  # Keep only columns that are not flagged for removal
+  data <- data[, !cols_to_remove, drop = FALSE]
+  
+  return(data)
+}
+
+fix_na_categories <- function(df, cols = c("isHispanic", "sex"), na_label = "NA") {
+  # Loop over each column in cols
+  for (col in cols) {
+    if (!col %in% names(df)) {
+      warning(paste("Column", col, "not found in the data frame. Skipping."))
+      next
+    }
+    
+    # Convert the column to a factor if it isn't already
+    if (!is.factor(df[[col]])) {
+      df[[col]] <- as.factor(df[[col]])
+    }
+    
+    # Add NA as an extra factor level
+    df[[col]] <- addNA(df[[col]])
+    
+    # Rename the NA level to the desired label.
+    # The new level produced by addNA() is stored with NA as a level name.
+    levels(df[[col]])[is.na(levels(df[[col]]))] <- na_label
+  }
+  return(df)
+}
+
+non_agg_cols <- c(
+  "Race",
+  "isHispanic",
+  "Relationship_Status",
+  "education",
+  "employment",
+  "sex",
+  "gender",
+  "sexuality",
+  "SI_mean",
+  "age",
+  "si_kde_weight",
+  "is_SI", 
+  "SI_mean_fold",
+  "set"
+)
+
+aggregate_cols <- function(data, type = "reg") {
+  # Determine non-agg columns present in the data
+  non_agg_present <- intersect(colnames(data), non_agg_cols)
+  # Remove non-agg columns AND PatientID from agg_cols
+  agg_cols <- setdiff(colnames(data), c(non_agg_present, "PatientID"))
+  
+  data <- data %>% 
+    group_by(PatientID) %>% 
+    summarize(
+      across(all_of(non_agg_present), first),
+      across(all_of(agg_cols), mean), 
+      .groups = "drop"
+    ) %>% 
+    select(-PatientID)
+  
+  if(type == "reg"){
+    data <- data %>% select(-is_SI)
+  } else {
+    data <- data %>% select(-SI_mean)
+  }
+  
+  return(data)
+}
+
+extract_best_elastic_net_params <- function(grid_results, model_type = "regression") {
+  # Validate model_type input.
+  if (!model_type %in% c("regression", "classification")) {
+    stop("model_type must be either 'regression' or 'classification'")
+  }
+  
+  # Subset only the rows labeled "mean"
+  mean_rows <- grid_results[rownames(grid_results) == "mean", ]
+  
+  if (model_type == "regression") {
+    # For regression, sort these mean rows in ascending order based on the "overall" metric.
+    mean_rows_sorted <- mean_rows[order(mean_rows[,"overall"]), ]
+  } else if (model_type == "classification") {
+    # For classification, sort in descending order based on the "AUC" metric (i.e., best AUC at the top).
+    mean_rows_sorted <- mean_rows[order(-mean_rows[,"AUC"]), ]
+  }
+  
+  # Extract the best configuration string from the top row.
+  best_config_string <- mean_rows_sorted[1, "best config"]
+  
+  # Parse the config string (expected format: "alpha=0, lambda=0.001").
+  parts <- strsplit(best_config_string, ",")[[1]]
+  best_alpha <- as.numeric(trimws(strsplit(parts[1], "=")[[1]][2]))
+  best_lambda <- as.numeric(trimws(strsplit(parts[2], "=")[[1]][2]))
+  
+  # Extract all rows from grid_results (both "mean" and "sd") that share the best config string.
+  best_df <- grid_results[grid_results[,"best config"] == best_config_string, , drop = FALSE]
+  
+  # Return a list with the best hyperparameters and the corresponding grid rows.
+  return(list(hyperparams = list(alpha = best_alpha, lambda = best_lambda),
+              best_df = best_df))
+}
+
+
+```
+
+
+# Load Data
+```{r}
+
+fitbit_reg <- read_tsv("../../data/deep_learning/fitbit_reg.tsv", show_col_types = F) %>% remove_vars() %>% aggregate_cols(., type = "reg")
+fitbit_class <- read_tsv("../../data/deep_learning/fitbit_class.tsv", show_col_types = F) %>% remove_vars() %>% aggregate_cols(., type = "class")
+
+comb_reg <- read_tsv("../../data/deep_learning/comb_reg.tsv", show_col_types = F) %>% remove_vars() %>% fix_na_categories() %>% aggregate_cols(., type = "reg")
+comb_class <- read_tsv("../../data/deep_learning/comb_class.tsv", show_col_types = F) %>% remove_vars() %>% fix_na_categories() %>% aggregate_cols(., type = "class")
+
+```
+
+
+```{r}
+fitbit_class %>% colnames()
+```
+
+```{r}
+OLS_search <- function(df, target = "SI_mean", weights = FALSE, use_elastic_net = FALSE, polydeg = 1) {
+  
+  # Split the data using the "set" column (using only "train" for cross‑validation)
+  train_data <- df[df$set == "train", ]
+  
+  # Define predictors as all columns except target, si_kde_weight, `SI_mean fold`, and set.
+  predictors <- setdiff(names(df), c(target, "si_kde_weight", "SI_mean fold", "set"))
+  
+  # ------------------------------------------------------------
+  # Polynomial Expansion for Numeric Predictors (if polydeg > 1)
+  # ------------------------------------------------------------
+  # Start with the predictors data frame from the training set.
+  predictor_df <- train_data[, predictors, drop = FALSE]
+  
+  # Identify numeric columns in the predictors
+  numeric_vars <- sapply(predictor_df, is.numeric)
+  
+  # If polynomial degree is greater than 1, expand numeric predictors using raw polynomials.
+  if (polydeg > 1) {
+    for (nm in names(numeric_vars)[numeric_vars]) {
+      # Compute polynomial terms (powers) for the column
+      poly_matrix <- sapply(1:polydeg, function(d) predictor_df[[nm]]^d)
+      colnames(poly_matrix) <- paste(nm, 1:polydeg, sep = "_")
+      predictor_df[[nm]] <- NULL  # Remove original column
+      predictor_df <- cbind(predictor_df, poly_matrix)
+    }
+  }
+  
+  # Create a design matrix: converts factors to dummy variables and ensures numeric predictors
+  X <- model.matrix(~ . - 1, data = predictor_df)
+  y <- train_data[[target]]
+  
+  if (weights) {
+    w <- train_data$si_kde_weight
+  }
+  
+  # Use the pre-defined folds in the training set (assumed numeric 1:5 in "SI_mean fold")
+  unique_folds <- sort(unique(train_data$`SI_mean fold`))
+  
+  if (use_elastic_net) {
+    # Define grid over alpha and lambda (0 = ridge, 1 = lasso, values in between for elastic net)
+    alphas <- seq(0, 1, length.out = 5)
+    lambdas <- 10^seq(-3, 1, length.out = 10)
+    grid <- expand.grid(alpha = alphas, lambda = lambdas)
+    
+    # To store results for each grid combination
+    grid_list <- list()
+    overall_means <- numeric(nrow(grid))
+    
+    # Loop over each grid combination of alpha and lambda
+    for(i in 1:nrow(grid)) {
+      a <- grid$alpha[i]
+      l <- grid$lambda[i]
+      overall_rmses <- c()
+      overall_mses <- c()  # vector for MSE across folds
+      level_rmses <- matrix(NA, nrow = length(unique_folds), ncol = 5)
+      
+      # Cross-validation: loop over each fold
+      for(fold_idx in seq_along(unique_folds)) {
+        current_fold <- unique_folds[fold_idx]
+        test_idx <- which(train_data$`SI_mean fold` == current_fold)
+        train_idx <- setdiff(seq_len(nrow(train_data)), test_idx)
+        
+        X_train <- X[train_idx, , drop = FALSE]
+        y_train <- y[train_idx]
+        X_test  <- X[test_idx, , drop = FALSE]
+        y_test  <- y[test_idx]
+        
+        if (weights) {
+          w_train <- w[train_idx]
+          model <- glmnet(X_train, y_train, weights = w_train, alpha = a, lambda = l)
+        } else {
+          model <- glmnet(X_train, y_train, alpha = a, lambda = l)
+        }
+        
+        pred <- predict(model, newx = X_test, s = l)
+        fold_overall <- sqrt(mean((y_test - pred)^2))
+        fold_mse <- mean((y_test - pred)^2)
+        overall_rmses <- c(overall_rmses, fold_overall)
+        overall_mses <- c(overall_mses, fold_mse)
+        
+        # Calculate RMSE for each level (1-5)
+        for (lvl in 1:5) {
+          idx <- which(round(y_test) == lvl)
+          if (length(idx) > 0) {
+            level_rmses[fold_idx, lvl] <- sqrt(mean((y_test[idx] - pred[idx])^2))
+          } else {
+            level_rmses[fold_idx, lvl] <- NA
+          }
+        }
+      }
+      
+      # Compute the means and standard deviations across folds for RMSE and MSE
+      overall_mean <- mean(overall_rmses)
+      overall_sd   <- sd(overall_rmses)
+      overall_mse_mean <- mean(overall_mses)
+      overall_mse_sd   <- sd(overall_mses)
+      
+      level_mean <- apply(level_rmses, 2, mean, na.rm = TRUE)
+      level_sd   <- apply(level_rmses, 2, sd, na.rm = TRUE)
+      
+      # Build a 2-row data frame capturing the mean and sd for each metric
+      config_str <- paste0("alpha=", round(a, 3), ", lambda=", round(l, 5))
+      df_out <- data.frame(
+        elastic_net = rep(TRUE, 2),
+        "1"         = c(level_mean[1], level_sd[1]),
+        "2"         = c(level_mean[2], level_sd[2]),
+        "3"         = c(level_mean[3], level_sd[3]),
+        "4"         = c(level_mean[4], level_sd[4]),
+        "5"         = c(level_mean[5], level_sd[5]),
+        overall     = c(overall_mean, overall_sd),
+        MSE         = c(overall_mse_mean, overall_mse_sd),
+        `best config` = rep(config_str, 2),
+        check.names = FALSE,
+        stringsAsFactors = FALSE
+      )
+      rownames(df_out) <- c("mean", "sd")
+      
+      grid_list[[i]] <- df_out
+      overall_means[i] <- overall_mean
+    }
+    
+    # Identify the best hyperparameters (lowest overall mean RMSE)
+    best_idx <- which.min(overall_means)
+    best_params <- list(alpha = grid$alpha[best_idx],
+                        lambda = grid$lambda[best_idx])
+    best_result <- grid_list[[best_idx]]
+    
+    # Return only the performance results for the optimal hyperparameters and the corresponding params.
+    return(list(optimal_result = best_result,
+                optimal_hyperparams = best_params))
+    
+  } else {
+    # OLS (non-elastic-net) branch: perform CV using linear models.
+    overall_rmses <- c()
+    overall_mses <- c()  # vector for MSE across folds
+    level_rmses <- matrix(NA, nrow = length(unique_folds), ncol = 5)
+    
+    for(fold_idx in seq_along(unique_folds)) {
+      current_fold <- unique_folds[fold_idx]
+      test_idx <- which(train_data$`SI_mean fold` == current_fold)
+      train_idx <- setdiff(seq_len(nrow(train_data)), test_idx)
+      train_fold_data <- train_data[train_idx, ]
+      test_fold_data  <- train_data[test_idx, ]
+      
+      # Build the regression formula using the predictors
+      preds <- predictors
+      formula <- as.formula(paste(target, "~", paste(preds, collapse = " + ")))
+      
+      if (weights) {
+        weights_vector <- train_fold_data$si_kde_weight
+        model <- lm(formula, data = train_fold_data, weights = weights_vector)
+      } else {
+        model <- lm(formula, data = train_fold_data)
+      }
+      
+      pred <- predict(model, newdata = test_fold_data)
+      fold_overall <- sqrt(mean((test_fold_data[[target]] - pred)^2))
+      fold_mse <- mean((test_fold_data[[target]] - pred)^2)
+      overall_rmses <- c(overall_rmses, fold_overall)
+      overall_mses <- c(overall_mses, fold_mse)
+      
+      for (lvl in 1:5) {
+        idx <- which(round(test_fold_data[[target]]) == lvl)
+        if (length(idx) > 0) {
+          level_rmses[fold_idx, lvl] <- sqrt(mean((test_fold_data[[target]][idx] - pred[idx])^2))
+        } else {
+          level_rmses[fold_idx, lvl] <- NA
+        }
+      }
+    }
+    
+    overall_mean <- mean(overall_rmses)
+    overall_sd   <- sd(overall_rmses)
+    overall_mse_mean <- mean(overall_mses)
+    overall_mse_sd   <- sd(overall_mses)
+    
+    level_mean <- apply(level_rmses, 2, mean, na.rm = TRUE)
+    level_sd   <- apply(level_rmses, 2, sd, na.rm = TRUE)
+    
+    # Build a 2-row data frame for the OLS results.
+    df_out <- data.frame(
+      elastic_net = c(FALSE, NA),
+      "1"         = c(level_mean[1], level_sd[1]),
+      "2"         = c(level_mean[2], level_sd[2]),
+      "3"         = c(level_mean[3], level_sd[3]),
+      "4"         = c(level_mean[4], level_sd[4]),
+      "5"         = c(level_mean[5], level_sd[5]),
+      overall     = c(overall_mean, overall_sd),
+      MSE         = c(overall_mse_mean, overall_mse_sd),
+      `best config` = c(NA, NA),
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+    rownames(df_out) <- c("mean", "sd")
+    
+    return(list(metrics = df_out, optimal_hyperparams = NA))
+  }
+}
+
+
+```
+
+
+```{r}
+# ===============================
+# Regression Models - Fitbit Data
+# ===============================
+# Unweighted models
+OLS_fitbit_nw <- OLS_search(fitbit_reg, target = "SI_mean", weights = FALSE, use_elastic_net = FALSE)
+OLS_fitbit_nw_opt <- OLS_search(fitbit_reg, target = "SI_mean", weights = FALSE, use_elastic_net = TRUE)
+
+# Weighted models
+OLS_fitbit_w <- OLS_search(fitbit_reg, target = "SI_mean", weights = TRUE, use_elastic_net = FALSE)
+OLS_fitbit_w_opt <- OLS_search(fitbit_reg, target = "SI_mean", weights = TRUE, use_elastic_net = TRUE)
+
+
+# View the metrics for the unweighted models
+OLS_fitbit_nw$metrics
+OLS_fitbit_nw_opt$optimal_result
+
+# View the metrics for the weighted models
+OLS_fitbit_w$metrics
+OLS_fitbit_w_opt$optimal_result
+```
+
+# Extract fitbit_val
+```{r}
+# For non-elastic net models, the performance matrix is in the "$metrics" element.
+df_nw_nen <- OLS_fitbit_nw$metrics %>% select(-c(elastic_net, `best config`))
+df_w_nen  <- OLS_fitbit_w$metrics %>% select(-c(elastic_net, `best config`))
+
+
+# For elastic net models, the performance is in the "$grid_results" element.
+df_nw_en  <- (OLS_fitbit_nw_opt$optimal_result %>% select(-c(elastic_net, `best config`)))
+df_w_en   <- (OLS_fitbit_w_opt$optimal_result %>% select(-c(elastic_net, `best config`)))
+
+# Instead of separate columns, add one Model column per naming scheme.
+df_nw_nen$Model <- "nw_nen"
+df_nw_en$Model   <- "nw_en"
+df_w_nen$Model   <- "w_nen"
+df_w_en$Model    <- "w_en"
+
+df_nw_nen$Data <- "fitbit"
+df_nw_en$Data   <- "fitbit"
+df_w_nen$Data   <- "fitbit"
+df_w_en$Data    <- "fitbit"
+
+
+df_nw_nen$stat <- rownames(df_nw_nen)
+df_nw_en$stat <- rownames(df_nw_en)
+df_w_nen$stat <- rownames(df_w_nen)
+df_w_en$stat <- rownames(df_w_en)
+
+rownames(df_nw_nen) <- NULL
+rownames(df_nw_en) <- NULL
+rownames(df_w_nen) <- NULL
+rownames(df_w_en) <- NULL
+
+# Combine the four data frames into one (and reorder so that Model is the first column).
+fitbit_val_reg_df <- rbind(df_nw_nen, df_nw_en, df_w_nen, df_w_en)
+
+fitbit_val_reg_df
+```
+
+
+
+
+```{r}
+# ===============================
+# Regression Models - Combined Data
+# ===============================
+# Unweighted models
+
+OLS_comb_nw <- OLS_search(comb_reg, target = "SI_mean", weights = FALSE, use_elastic_net = FALSE)
+OLS_comb_nw_opt <- OLS_search(comb_reg, target = "SI_mean", weights = FALSE, use_elastic_net = TRUE)
+
+# Weighted models
+OLS_comb_w <- OLS_search(comb_reg, target = "SI_mean", weights = TRUE, use_elastic_net = FALSE)
+OLS_comb_w_opt <- OLS_search(comb_reg, target = "SI_mean", weights = TRUE, use_elastic_net = TRUE)
+
+# View the metrics for the unweighted models
+OLS_comb_nw$metrics
+OLS_comb_nw_opt$optimal_result %>% select(-elastic_net)
+
+# View the metrics for the weighted models
+OLS_comb_nw_opt$optimal_hyperparams
+OLS_comb_w_opt$optimal_result %>% select(-elastic_net)
+```
+
+# Get comb validation
+```{r}
+# Extract and clean non-elastic net model metrics
+df_comb_nw_nen <- OLS_comb_nw$metrics %>% select(-c(elastic_net, `best config`))
+df_comb_w_nen  <- OLS_comb_w$metrics %>% select(-c(elastic_net, `best config`))
+
+# Extract and clean elastic net model metrics
+df_comb_nw_en  <- (OLS_comb_nw_opt$optimal_result %>% select(-c(elastic_net, `best config`)))
+df_comb_w_en   <- (OLS_comb_w_opt$optimal_result %>% select(-c(elastic_net, `best config`)))
+
+# Add Model identifier
+df_comb_nw_nen$Model <- "nw_nen"
+df_comb_nw_en$Model  <- "nw_en"
+df_comb_w_nen$Model  <- "w_nen"
+df_comb_w_en$Model   <- "w_en"
+
+# Add Data source identifier
+df_comb_nw_nen$Data <- "comb"
+df_comb_nw_en$Data  <- "comb"
+df_comb_w_nen$Data  <- "comb"
+df_comb_w_en$Data   <- "comb"
+
+# Add type column using rownames, then reset rownames
+df_comb_nw_nen$stat <- rownames(df_comb_nw_nen)
+df_comb_nw_en$stat <- rownames(df_comb_nw_en)
+df_comb_w_nen$stat <- rownames(df_comb_w_nen)
+df_comb_w_en$stat <- rownames(df_comb_w_en)
+
+rownames(df_comb_nw_nen) <- NULL
+rownames(df_comb_nw_en) <- NULL
+rownames(df_comb_w_nen) <- NULL
+rownames(df_comb_w_en) <- NULL
+
+# Combine all comb data
+comb_val_reg_df <- rbind(df_comb_nw_nen, df_comb_nw_en, df_comb_w_nen, df_comb_w_en)
+
+# View final result
+comb_val_reg_df
+
+```
+
+# Combine validation results
+```{r}
+val_reg_df <- rbind(fitbit_val_reg_df, comb_val_reg_df)
+write.table(val_reg_df, file = "results/val_reg_df.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+```{r, warning=FALSE}
+OLS_search_tt_shap_iml <- function(df, 
+                                   target = "SI_mean", 
+                                   weights = FALSE, 
+                                   use_elastic_net = FALSE, 
+                                   polydeg = 1, 
+                                   alpha = NA, 
+                                   lambda = NA,
+                                   nsim = 48,
+                                   model_name = NA,
+                                   shap_subsample = NULL,
+                                   ncores = 24) {
+  
+  # ---------------------------
+  # 1. Split data into train & test
+  # ---------------------------
+  train_data <- df[df$set == "train", ]
+  test_data  <- df[df$set == "test", ]
+  
+  # Define predictor names: remove target and extra columns
+  predictors <- setdiff(names(df), c(target, "si_kde_weight", "SI_mean fold", "set"))
+  
+  # ---------------------------
+  # 2. Prepare predictors with optional polynomial expansion
+  # ---------------------------
+  process_predictors <- function(data, predictors, polydeg) {
+    pred_df <- data[, predictors, drop = FALSE]
+    # Identify numeric columns
+    numeric_vars <- sapply(pred_df, is.numeric)
+    if (polydeg > 1) {
+      for (nm in names(numeric_vars)[numeric_vars]) {
+        # For this example we use raw polynomials; if rank deficiency is an issue,
+        # consider using orthogonal polynomials via poly(..., raw = FALSE)
+        poly_matrix <- sapply(1:polydeg, function(d) pred_df[[nm]]^d)
+        colnames(poly_matrix) <- paste(nm, 1:polydeg, sep = "_")
+        pred_df[[nm]] <- NULL
+        pred_df <- cbind(pred_df, poly_matrix)
+      }
+    }
+    # Create design matrix with dummy encoding and no intercept.
+    X <- model.matrix(~ . - 1, data = pred_df)
+    return(X)
+  }
+  
+  # Process predictors for training and testing sets
+  X_train <- process_predictors(train_data, predictors, polydeg)
+  X_test  <- process_predictors(test_data, predictors, polydeg)
+  
+  # Outcome vectors
+  y_train <- train_data[[target]]
+  y_test  <- test_data[[target]]
+  
+  # Extract weights if requested
+  if (weights) {
+    w_train <- train_data$si_kde_weight
+    w_test  <- test_data$si_kde_weight
+  }
+  
+  # ---------------------------
+  # 3. Fit the Model on the Training Set
+  # ---------------------------
+  if (use_elastic_net) {
+    if (is.na(alpha)) {
+      warning("alpha not provided. Setting alpha = 0.5 (elastic net).")
+      alpha <- 0.5
+    }
+    if (is.na(lambda)) {
+      warning("lambda not provided. Setting lambda = 0.01.")
+      lambda <- 0.01
+    }
+    if (weights) {
+      model <- glmnet(x = X_train, y = y_train, weights = w_train, 
+                      alpha = alpha, lambda = lambda)
+    } else {
+      model <- glmnet(x = X_train, y = y_train, alpha = alpha, lambda = lambda)
+    }
+    best_config <- paste0("alpha=", round(alpha, 3), ", lambda=", round(lambda, 5))
+    
+    # Prediction function for elastic net: expects a newx matrix.
+    pred_fn <- function(model, newdata) {
+      newdata_matrix <- as.matrix(newdata)
+      as.vector(predict(model, newx = newdata_matrix, s = lambda))
+    }
+  } else {
+    # Fit an OLS model using lm on the original predictors.
+    form <- as.formula(paste(target, "~", paste(predictors, collapse = " + ")))
+    if (weights) {
+      model <- lm(formula = form, data = train_data, 
+                  weights = train_data$si_kde_weight)
+    } else {
+      model <- lm(formula = form, data = train_data)
+    }
+    best_config <- NA
+    
+    # Prediction function for OLS: expects newdata with original variable names.
+    pred_fn <- function(model, newdata) {
+      predict(model, newdata = newdata)
+    }
+  }
+  
+  # ---------------------------
+  # 4. Compute Performance Metrics on Train and Test Sets
+  # ---------------------------
+  if (use_elastic_net) {
+    pred_train <- pred_fn(model, as.data.frame(X_train))
+    pred_test  <- pred_fn(model, as.data.frame(X_test))
+  } else {
+    pred_train <- pred_fn(model, train_data)
+    pred_test  <- pred_fn(model, test_data)
+  }
+  
+  compute_rmse_metrics <- function(y_true, pred) {
+    overall_rmse <- sqrt(mean((y_true - pred)^2))
+    level_rmse <- sapply(1:5, function(lvl) {
+      idx <- which(round(y_true) == lvl)
+      if (length(idx) > 0) sqrt(mean((y_true[idx] - pred[idx])^2)) else NA
+    })
+    c(level_rmse, overall = overall_rmse)
+  }
+  
+  metrics_train <- compute_rmse_metrics(y_train, pred_train)
+  metrics_test  <- compute_rmse_metrics(y_test, pred_test)
+  
+  perf_df <- data.frame(
+    type = c("train", "test"),
+    model = model_name,
+    "1" = c(metrics_train[1], metrics_test[1]),
+    "2" = c(metrics_train[2], metrics_test[2]),
+    "3" = c(metrics_train[3], metrics_test[3]),
+    "4" = c(metrics_train[4], metrics_test[4]),
+    "5" = c(metrics_train[5], metrics_test[5]),
+    overall = c(metrics_train["overall"], metrics_test["overall"]),
+    check.names=F,
+    stringsAsFactors = FALSE
+  )
+  
+  # ---------------------------
+  # 5. Compute SHAP scores on the Training Set using fastshap with parallelization
+  # ---------------------------
+  # Use processed design matrix for elastic net; original predictors for OLS.
+  if (use_elastic_net) {
+    X_shap <- as.data.frame(X_train)
+    obs_ids <- 1:nrow(X_train)
+  } else {
+    X_shap <- train_data[, predictors, drop = FALSE]
+    obs_ids <- 1:nrow(train_data)
+  }
+  
+  # Optionally, subsample observations for SHAP computation.
+  if (!is.null(shap_subsample)) {
+    set.seed(123)
+    sampled_indices <- sample(nrow(X_shap), size = shap_subsample)
+    X_shap <- X_shap[sampled_indices, , drop = FALSE]
+    obs_ids <- sampled_indices
+  }
+  
+  # Set up a parallel backend using doParallel.
+  cl <- makeCluster(ncores)
+  clusterEvalQ(cl, library(glmnet))  # ensure glmnet is loaded on every worker
+  registerDoParallel(cl)
+  
+  shap_scores <- fastshap::explain(
+    object = model,
+    X = X_shap,
+    pred_wrapper = pred_fn,
+    nsim = nsim,
+    parallel = TRUE
+  )
+  
+  stopCluster(cl)
+  
+  # Append observation IDs for clarity.
+  shap_scores <- cbind(obs_id = obs_ids, shap_scores)
+  
+  # ---------------------------
+  # 6. Return the Results
+  # ---------------------------
+  return(list(
+    shap_scores = shap_scores,
+    metrics = perf_df
+  ))
+}
+
+# 
+# OLS_search_tt_shap_iml(comb_reg, target = "SI_mean", weights = FALSE, 
+#                                           use_elastic_net = FALSE)
+
+```
+
+
+# fitbit train/test perf
+```{r}
+fitbit_nw_nonen <- OLS_search_tt_shap_iml(fitbit_reg, target = "SI_mean", weights = FALSE, 
+                                          use_elastic_net = FALSE, model_name="fitbit_nw_nonen")
+fitbit_nw_en    <- OLS_search_tt_shap_iml(fitbit_reg, target = "SI_mean", weights = FALSE, 
+                                          use_elastic_net = TRUE, model_name = "fitbiut_nw_en",
+                                          alpha = OLS_fitbit_nw_opt$optimal_hyperparams$alpha, lambda = OLS_fitbit_nw_opt$optimal_hyperparams$lambda)
+fitbit_w_nonen  <- OLS_search_tt_shap_iml(fitbit_reg, target = "SI_mean", model_name = "fitbit_w_nonen",
+                                          weights = TRUE, use_elastic_net = FALSE)
+fitbit_w_en     <- OLS_search_tt_shap_iml(fitbit_reg, target = "SI_mean", weights = TRUE, 
+                                          use_elastic_net = TRUE, model_name = "fitbit_w_en",
+                                          alpha = OLS_fitbit_nw_opt$optimal_hyperparams$alpha, lambda = OLS_fitbit_nw_opt$optimal_hyperparams$lambda)
+
+
+```
+
+
+# comb train/test perf
+```{r}
+# Now, run the OLS_search_tt_shap_iml function for each condition on comb_reg:
+comb_nw_nonen <- OLS_search_tt_shap_iml(comb_reg, target = "SI_mean", weights = FALSE, 
+                                          use_elastic_net = FALSE, model_name="comb_nw_nonen")
+comb_nw_en    <- OLS_search_tt_shap_iml(comb_reg, target = "SI_mean", weights = FALSE, 
+                                          use_elastic_net = TRUE, model_name = "comb_nw_en",
+                                          alpha = OLS_comb_nw_opt$optimal_hyperparams$alpha, lambda = OLS_comb_nw_opt$optimal_hyperparams$lambda)
+comb_w_nonen  <- OLS_search_tt_shap_iml(comb_reg, target = "SI_mean", model_name = "comb_w_nonen",
+                                          weights = TRUE, use_elastic_net = FALSE)
+comb_w_en     <- OLS_search_tt_shap_iml(comb_reg, target = "SI_mean", weights = TRUE, 
+                                          use_elastic_net = TRUE, model_name = "comb_w_en",
+                                          alpha = OLS_comb_w_opt$optimal_hyperparams$alpha, lambda = OLS_comb_w_opt$optimal_hyperparams$lambda)
+
+
+```
+
+# Save Shaps  
+```{r}
+write.table(fitbit_nw_nonen$shap_scores, file="SHAP/fitbit_nw_nonen_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(fitbit_nw_en$shap_scores, file="SHAP/fitbit_nw_en_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(fitbit_w_nonen$shap_scores, file="SHAP/fitbit_w_nonen_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(fitbit_w_en$shap_scores, file="SHAP/fitbit_w_en_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(comb_nw_nonen$shap_scores, file="SHAP/comb_nw_nonen_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(comb_nw_en$shap_scores, file="SHAP/comb_nw_en_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(comb_w_nonen$shap_scores, file="SHAP/comb_w_nonen_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+write.table(comb_w_en$shap_scores, file="SHAP/comb_w_en_SHAP.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+
+```
+
+# Save best perf
+```{r}
+reg_perf <- rbind(
+  fitbit_nw_nonen$metrics,
+  fitbit_nw_en$metrics,
+  fitbit_w_nonen$metrics,
+  fitbit_w_en$metrics,
+  comb_nw_nonen$metrics,
+  comb_nw_en$metrics,
+  comb_w_nonen$metrics,
+  comb_w_en$metrics
+)
+
+write.table(reg_perf, file="results/reg_perf.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+
+```
+
+
+
+# Classification
+```{r}
+Logistic_search <- function(df, target = "is_SI", weights = FALSE, use_elastic_net = FALSE, polydeg = 1) {
+
+  # Split the data using the "set" column (using only "train" for cross‑validation)
+  train_data <- df[df$set == "train", ]
+  
+  # Define predictors as all columns except target, si_kde_weight, `SI_mean fold`, and set.
+  predictors <- setdiff(names(df), c(target, "si_kde_weight", "SI_mean fold", "set"))
+  
+  # ------------------------------------------------------------
+  # Polynomial Expansion for Numeric Predictors (if polydeg > 1)
+  # ------------------------------------------------------------
+  predictor_df <- train_data[, predictors, drop = FALSE]
+  numeric_vars <- sapply(predictor_df, is.numeric)
+  if (polydeg > 1) {
+    for (nm in names(numeric_vars)[numeric_vars]) {
+      poly_matrix <- sapply(1:polydeg, function(d) predictor_df[[nm]]^d)
+      colnames(poly_matrix) <- paste(nm, 1:polydeg, sep = "_")
+      predictor_df[[nm]] <- NULL
+      predictor_df <- cbind(predictor_df, poly_matrix)
+    }
+  }
+  
+  # For the elastic net branch we use a design matrix computed from the training predictors.
+  if (use_elastic_net) {
+    X <- model.matrix(~ . - 1, data = predictor_df)
+  }
+  
+  # Outcome vector from the training set (ensure numeric 0/1)
+  y <- train_data[[target]]
+  if (is.factor(y)) {
+    y <- as.numeric(as.character(y))
+  } else {
+    y <- as.numeric(y)
+  }
+  
+  if (weights) {
+    w <- train_data$si_kde_weight
+  }
+  
+  # Predefined folds from `SI_mean fold`
+  unique_folds <- sort(unique(train_data$`SI_mean fold`))
+  
+  # Update metric names to include binary cross entropy.
+  metric_names <- c("AUC", "accuracy", "sensitivity", "specificity", "binary_cross_entropy")
+  
+  if (use_elastic_net) {
+    # Define grid over alpha and lambda.
+    alphas <- seq(0, 1, length.out = 5)
+    lambdas <- 10^seq(-3, 1, length.out = 10)
+    grid <- expand.grid(alpha = alphas, lambda = lambdas)
+    
+    grid_results_list <- list()
+    mean_metrics_mat <- matrix(NA, nrow = nrow(grid), ncol = length(metric_names))
+    colnames(mean_metrics_mat) <- metric_names
+    
+    for(i in 1:nrow(grid)) {
+      a <- grid$alpha[i]
+      l <- grid$lambda[i]
+      fold_metrics <- matrix(NA, nrow = length(unique_folds), ncol = length(metric_names))
+      colnames(fold_metrics) <- metric_names
+      
+      for(fold_idx in seq_along(unique_folds)) {
+        current_fold <- unique_folds[fold_idx]
+        test_idx <- which(train_data$`SI_mean fold` == current_fold)
+        train_idx <- setdiff(seq_len(nrow(train_data)), test_idx)
+        
+        X_train <- X[train_idx, , drop = FALSE]
+        y_train <- y[train_idx]
+        X_test <- X[test_idx, , drop = FALSE]
+        y_test <- y[test_idx]
+        
+        if (weights) {
+          w_train <- w[train_idx]
+          model <- glmnet::glmnet(X_train, y_train, family = "binomial", 
+                                  weights = w_train, alpha = a, lambda = l, maxit = 10000)
+        } else {
+          model <- glmnet::glmnet(X_train, y_train, family = "binomial", 
+                                  alpha = a, lambda = l, maxit = 10000)
+        }
+        
+        pred_prob <- predict(model, newx = X_test, s = l, type = "response")
+        pred_prob <- as.vector(pred_prob)
+        pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+        auc_val <- tryCatch(as.numeric(pROC::auc(pROC::roc(y_test, pred_prob))), error = function(e) NA)
+        accuracy_val <- mean(pred_class == y_test)
+        sensitivity_val <- if (sum(y_test == 1) > 0) {
+          sum(pred_class == 1 & y_test == 1) / sum(y_test == 1)
+        } else NA
+        specificity_val <- if (sum(y_test == 0) > 0) {
+          sum(pred_class == 0 & y_test == 0) / sum(y_test == 0)
+        } else NA
+        
+        # Compute binary cross entropy (adding a small epsilon to avoid log(0))
+        epsilon <- 1e-15
+        bce_val <- -mean(y_test * log(pred_prob + epsilon) + (1 - y_test) * log(1 - pred_prob + epsilon))
+        
+        fold_metrics[fold_idx, ] <- c(auc_val, accuracy_val, sensitivity_val, specificity_val, bce_val)
+      }
+      
+      mean_fold <- colMeans(fold_metrics, na.rm = TRUE)
+      sd_fold <- apply(fold_metrics, 2, sd, na.rm = TRUE)
+      mean_metrics_mat[i, ] <- mean_fold
+      
+      config_str <- paste0("alpha=", round(a, 3), ", lambda=", round(l, 5))
+      df_out <- data.frame(
+        elastic_net = rep(TRUE, 2),
+        AUC = c(mean_fold["AUC"], sd_fold["AUC"]),
+        accuracy = c(mean_fold["accuracy"], sd_fold["accuracy"]),
+        sensitivity = c(mean_fold["sensitivity"], sd_fold["sensitivity"]),
+        specificity = c(mean_fold["specificity"], sd_fold["specificity"]),
+        binary_cross_entropy = c(mean_fold["binary_cross_entropy"], sd_fold["binary_cross_entropy"]),
+        `best config` = rep(config_str, 2),
+        check.names = FALSE, stringsAsFactors = FALSE
+      )
+      rownames(df_out) <- c("mean", "sd")
+      grid_results_list[[i]] <- df_out
+    }
+    
+    # Determine the optimal configuration (highest mean AUC)
+    best_idx <- which.max(mean_metrics_mat[, "AUC"])
+    best_params <- list(alpha = grid$alpha[best_idx],
+                        lambda = grid$lambda[best_idx])
+    
+    # Return only the metrics for the optimal configuration
+    optimal_metrics <- grid_results_list[[best_idx]]
+    return(list(metrics = optimal_metrics, optimal_hyperparams = best_params))
+    
+  } else {
+    # Non-elastic net: Use ordinary logistic regression via glm.
+    fold_metrics <- matrix(NA, nrow = length(unique_folds), ncol = length(metric_names))
+    colnames(fold_metrics) <- metric_names
+    
+    for (fold_idx in seq_along(unique_folds)) {
+      current_fold <- unique_folds[fold_idx]
+      test_idx <- which(train_data$`SI_mean fold` == current_fold)
+      train_idx <- setdiff(seq_len(nrow(train_data)), test_idx)
+      
+      train_fold_data <- train_data[train_idx, ]
+      test_fold_data <- train_data[test_idx, ]
+      
+      # For the "Race" column, drop test observations with new levels not present in the training fold.
+      if("Race" %in% predictors) {
+        # Ensure both train and test Race variables are factors.
+        train_fold_data$Race <- as.factor(train_fold_data$Race)
+        test_fold_data$Race <- as.factor(test_fold_data$Race)
+        valid_levels <- levels(train_fold_data$Race)
+        test_fold_data <- test_fold_data[test_fold_data$Race %in% valid_levels, ]
+      }
+      
+      preds <- predictors
+      formula <- as.formula(paste(target, "~", paste(preds, collapse = " + ")))
+      
+      if (weights) {
+        weights_vector <- train_fold_data$si_kde_weight
+        model <- glm(formula, data = train_fold_data, family = binomial,
+                     weights = weights_vector, control = glm.control(maxit = 10000))
+      } else {
+        model <- glm(formula, data = train_fold_data, family = binomial,
+                     control = glm.control(maxit = 10000))
+      }
+      
+      pred_prob <- predict(model, newdata = test_fold_data, type = "response")
+      pred_prob <- as.vector(pred_prob)
+      y_test <- test_fold_data[[target]]
+      if (is.factor(y_test)) {
+        y_test <- as.numeric(as.character(y_test))
+      } else {
+        y_test <- as.numeric(y_test)
+      }
+      
+      pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+      auc_val <- tryCatch(as.numeric(pROC::auc(pROC::roc(y_test, pred_prob))), error = function(e) NA)
+      accuracy_val <- mean(pred_class == y_test)
+      sensitivity_val <- if (sum(y_test == 1) > 0) {
+        sum(pred_class == 1 & y_test == 1) / sum(y_test == 1)
+      } else NA
+      specificity_val <- if (sum(y_test == 0) > 0) {
+        sum(pred_class == 0 & y_test == 0) / sum(y_test == 0)
+      } else NA
+      
+      # Compute binary cross entropy for the fold
+      epsilon <- 1e-15
+      bce_val <- -mean(y_test * log(pred_prob + epsilon) + (1 - y_test) * log(1 - pred_prob + epsilon))
+      
+      fold_metrics[fold_idx, ] <- c(auc_val, accuracy_val, sensitivity_val, specificity_val, bce_val)
+    }
+    
+    mean_metrics <- colMeans(fold_metrics, na.rm = TRUE)
+    sd_metrics <- apply(fold_metrics, 2, sd, na.rm = TRUE)
+    
+    df_out <- data.frame(
+      elastic_net = c(FALSE, NA),
+      AUC = c(mean_metrics["AUC"], sd_metrics["AUC"]),
+      accuracy = c(mean_metrics["accuracy"], sd_metrics["accuracy"]),
+      sensitivity = c(mean_metrics["sensitivity"], sd_metrics["sensitivity"]),
+      specificity = c(mean_metrics["specificity"], sd_metrics["specificity"]),
+      binary_cross_entropy = c(mean_metrics["binary_cross_entropy"], sd_metrics["binary_cross_entropy"]),
+      `best config` = c(NA, NA),
+      check.names = FALSE, stringsAsFactors = FALSE
+    )
+    rownames(df_out) <- c("mean", "sd")
+    
+    return(list(metrics = df_out, optimal_hyperparams = NA))
+  }
+}
+
+
+
+```
+
+
+```{r}
+# ===============================
+# Logistic Regression Models - Fitbit Data
+# ===============================
+# Unweighted models
+Logistic_fitbit_nw <- Logistic_search(fitbit_class, target = "is_SI", weights = FALSE, use_elastic_net = FALSE)
+Logistic_fitbit_nw_opt <- Logistic_search(fitbit_class, target = "is_SI", weights = FALSE, use_elastic_net = TRUE)
+
+# Weighted models
+Logistic_fitbit_w <- Logistic_search(fitbit_class, target = "is_SI", weights = TRUE, use_elastic_net = FALSE)
+Logistic_fitbit_w_opt <- Logistic_search(fitbit_class, target = "is_SI", weights = TRUE, use_elastic_net = TRUE)
+
+# View the metrics for the unweighted models
+Logistic_fitbit_nw$metrics %>% select(-c(elastic_net, `best config`))
+Logistic_fitbit_nw_opt$metrics %>% select(-c(elastic_net, `best config`))
+
+
+
+# View the metrics for the weighted models
+Logistic_fitbit_w$metrics%>% select(-c(elastic_net, `best config`))
+Logistic_fitbit_w_opt$metrics %>% select(-c(elastic_net, `best config`))
+
+```
+
+
+
+```{r}
+# ===============================
+# Logistic Regression Models - Combined Data
+# ===============================
+# Unweighted models
+Logistic_comb_nw <- Logistic_search(comb_class, target = "is_SI", weights = FALSE, use_elastic_net = FALSE)
+Logistic_comb_nw_opt <- Logistic_search(comb_class, target = "is_SI", weights = FALSE, use_elastic_net = TRUE)
+
+# Weighted models
+Logistic_comb_w <- Logistic_search(comb_class, target = "is_SI", weights = TRUE, use_elastic_net = FALSE)
+Logistic_comb_w_opt <- Logistic_search(comb_class, target = "is_SI", weights = TRUE, use_elastic_net = TRUE)
+
+# View the metrics for the unweighted models
+Logistic_comb_nw$metrics
+Logistic_comb_nw_opt$metrics
+
+# View the metrics for the weighted models
+Logistic_comb_w$metrics
+Logistic_comb_w_opt$metrics
+
+```
+
+
+```{r}
+# ===============================
+# Logistic Regression Models - Fitbit Data Validation Extraction
+# ===============================
+# For non-elastic net logistic models, the performance matrix is stored in the "$metrics" element.
+df_log_nw_nen <- Logistic_fitbit_nw$metrics %>% select(-c(elastic_net, `best config`))
+df_log_w_nen  <- Logistic_fitbit_w$metrics %>% select(-c(elastic_net, `best config`))
+
+
+Logistic_fitbit_nw_opt$grid_results
+
+# For elastic net logistic models, the performance is stored in the "$grid_results" element.
+# We extract the best grid results using the helper function `extract_best_elastic_net_params()`.
+df_log_nw_en <- Logistic_fitbit_nw_opt$metrics %>% select(-c(elastic_net, `best config`))
+df_log_w_en  <- Logistic_fitbit_w_opt$metrics %>% select(-c(elastic_net, `best config`))
+
+# Add an identifier for the Model type.
+df_log_nw_nen$Model <- "nw_nen"  # non-weighted, non-elastic net
+df_log_nw_en$Model  <- "nw_en"   # non-weighted, elastic net
+df_log_w_nen$Model  <- "w_nen"   # weighted, non-elastic net
+df_log_w_en$Model   <- "w_en"    # weighted, elastic net
+
+# Add an identifier for the data source.
+df_log_nw_nen$Data <- "fitbit"
+df_log_nw_en$Data  <- "fitbit"
+df_log_w_nen$Data  <- "fitbit"
+df_log_w_en$Data   <- "fitbit"
+
+# Add a column for the metric type (e.g., row names "mean" and "sd").
+df_log_nw_nen$stat <- rownames(df_log_nw_nen)
+df_log_nw_en$stat  <- rownames(df_log_nw_en)
+df_log_w_nen$stat  <- rownames(df_log_w_nen)
+df_log_w_en$stat   <- rownames(df_log_w_en)
+
+# Reset row names before combining.
+rownames(df_log_nw_nen) <- NULL
+rownames(df_log_nw_en)  <- NULL
+rownames(df_log_w_nen)  <- NULL
+rownames(df_log_w_en)   <- NULL
+
+# Combine the four data frames into one consolidated validation results data frame.
+fitbit_log_val_df <- rbind(df_log_nw_nen, df_log_nw_en, df_log_w_nen, df_log_w_en)
+
+# View the final pooled validation results.
+fitbit_log_val_df
+
+```
+
+```{r}
+# ===============================
+# Get comb validation for logistic regression
+# ===============================
+
+# Extract and clean non-elastic net model metrics
+df_comb_nw_nen <- Logistic_comb_nw$metrics %>% select(-c(elastic_net, `best config`))
+df_comb_w_nen  <- Logistic_comb_w$metrics %>% select(-c(elastic_net, `best config`))
+
+# For elastic net logistic models, use extract_best_elastic_net_params with model_type="classification"
+df_comb_nw_en <- Logistic_comb_nw_opt$metrics %>% select(-c(elastic_net, `best config`))
+df_comb_w_en  <- Logistic_comb_w_opt$metrics %>% select(-c(elastic_net, `best config`))
+
+# Add Model identifier for each
+df_comb_nw_nen$Model <- "nw_nen"  # non-weighted, non-elastic net
+df_comb_nw_en$Model  <- "nw_en"   # non-weighted, elastic net
+df_comb_w_nen$Model  <- "w_nen"   # weighted, non-elastic net
+df_comb_w_en$Model   <- "w_en"    # weighted, elastic net
+
+# Add Data source identifier
+df_comb_nw_nen$Data <- "comb"
+df_comb_nw_en$Data  <- "comb"
+df_comb_w_nen$Data  <- "comb"
+df_comb_w_en$Data   <- "comb"
+
+# Add type column using rownames (e.g., "mean" and "sd") then reset the rownames
+df_comb_nw_nen$stat <- rownames(df_comb_nw_nen)
+df_comb_nw_en$stat  <- rownames(df_comb_nw_en)
+df_comb_w_nen$stat  <- rownames(df_comb_w_nen)
+df_comb_w_en$stat   <- rownames(df_comb_w_en)
+
+rownames(df_comb_nw_nen) <- NULL
+rownames(df_comb_nw_en)  <- NULL
+rownames(df_comb_w_nen)  <- NULL
+rownames(df_comb_w_en)   <- NULL
+
+# Combine the four data frames into one combined validation results data frame
+comb_val_df <- rbind(df_comb_nw_nen, df_comb_nw_en, df_comb_w_nen, df_comb_w_en)
+```
+
+```{r}
+val_class_df <- rbind(fitbit_log_val_df, comb_val_df)
+write.table(val_class_df, file = "results/val_class_df.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+# Get train test perf and SHap for classification
+```{r}
+Logistic_search_tt_shap_iml <- function(df, 
+                                          target = "is_SI", 
+                                          weights = FALSE, 
+                                          use_elastic_net = FALSE, 
+                                          polydeg = 1, 
+                                          alpha = NA, 
+                                          lambda = NA,
+                                          nsim = 48,
+                                          model_name = NA,
+                                          shap_subsample = NULL,
+                                          ncores = 24) {
+  # ---------------------------
+  # 1. Split data into train & test
+  # ---------------------------
+  
+  train_data <- df[df$set == "train", ]
+  test_data  <- df[df$set == "test", ]
+  
+  # Define predictor names: remove target, weight, fold, and set variables.
+  predictors <- setdiff(names(df), c(target, "si_kde_weight", "SI_mean fold", "set"))
+  
+  # ---------------------------
+  # 2. Prepare predictors with optional polynomial expansion
+  # ---------------------------
+  process_predictors <- function(data, predictors, polydeg) {
+    pred_df <- data[, predictors, drop = FALSE]
+    # Identify numeric columns
+    numeric_vars <- sapply(pred_df, is.numeric)
+    if (polydeg > 1) {
+      for (nm in names(pred_df)[numeric_vars]) {
+        poly_matrix <- sapply(1:polydeg, function(d) pred_df[[nm]]^d)
+        colnames(poly_matrix) <- paste(nm, 1:polydeg, sep = "_")
+        pred_df[[nm]] <- NULL
+        pred_df <- cbind(pred_df, poly_matrix)
+      }
+    }
+    return(pred_df)
+  }
+  
+  # Process predictors for both branches; note we use the processed predictors for both 
+  # elastic net and standard glm so that the model sees the intended (possibly expanded) features.
+  train_processed <- process_predictors(train_data, predictors, polydeg)
+  test_processed  <- process_predictors(test_data, predictors, polydeg)
+  
+  if (use_elastic_net) {
+    # For elastic net we compute a design matrix via model.matrix.
+    X_train <- model.matrix(~ . - 1, data = train_processed)
+    X_test  <- model.matrix(~ . - 1, data = test_processed)
+  } else {
+    # For standard glm, we update the formula based on the processed predictors.
+    predictors_new <- names(train_processed)
+  }
+  
+  # ---------------------------
+  # 3. Prepare outcome variables and weights for logistic regression
+  # ---------------------------
+  y_train <- train_data[[target]]
+  y_test  <- test_data[[target]]
+  # Ensure binary numeric outcome
+  if (is.factor(y_train)) {
+    y_train <- as.numeric(as.character(y_train))
+  } else {
+    y_train <- as.numeric(y_train)
+  }
+  if (is.factor(y_test)) {
+    y_test <- as.numeric(as.character(y_test))
+  } else {
+    y_test <- as.numeric(y_test)
+  }
+  
+  if (weights) {
+    w_train <- train_data$si_kde_weight
+    w_test  <- test_data$si_kde_weight
+  }
+  
+  # ---------------------------
+  # 4. Fit the Model on the Training Set
+  # ---------------------------
+  if (use_elastic_net) {
+    if (weights) {
+      model <- glmnet::glmnet(x = X_train, y = y_train, family = "binomial",
+                              weights = w_train, alpha = alpha, lambda = lambda, maxit = 10000)
+    } else {
+      model <- glmnet::glmnet(x = X_train, y = y_train, family = "binomial",
+                              alpha = alpha, lambda = lambda, maxit = 10000)
+    }
+    best_config <- paste0("alpha=", round(alpha, 3), ", lambda=", round(lambda, 5))
+    
+    # Prediction function for elastic net: note inclusion of ... to pass extra arguments.
+    pred_fn <- function(model, newdata, ...) {
+      newdata_matrix <- as.matrix(newdata)
+      as.vector(predict(model, newx = newdata_matrix, s = lambda, type = "response", ...))
+    }
+  } else {
+    # Fit logistic regression using glm on the processed predictors.
+    form <- as.formula(paste(target, "~", paste(predictors_new, collapse = " + ")))
+    train_glm_data <- cbind(train_data[, target, drop = FALSE], train_processed)
+    if (weights) {
+      model <- glm(formula = form, data = train_glm_data, family = binomial,
+                   weights = train_data$si_kde_weight, control = glm.control(maxit = 10000))
+    } else {
+      model <- glm(formula = form, data = train_glm_data, family = binomial,
+                   control = glm.control(maxit = 10000))
+    }
+    best_config <- NA
+    
+    # Prediction function for glm: include ... in the definition.
+    pred_fn <- function(model, newdata, ...) {
+      as.vector(predict(model, newdata = newdata, type = "response", ...))
+    }
+  }
+  
+  # ---------------------------
+  # 5. Compute Performance Metrics on Train and Test Sets
+  # ---------------------------
+  compute_logistic_metrics <- function(y_true, pred_prob) {
+    pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+    auc_val <- tryCatch(as.numeric(pROC::auc(pROC::roc(y_true, pred_prob))), error = function(e) NA)
+    accuracy_val <- mean(pred_class == y_true)
+    sensitivity_val <- if (sum(y_true == 1) > 0) {
+      sum(pred_class == 1 & y_true == 1) / sum(y_true == 1)
+    } else NA
+    specificity_val <- if (sum(y_true == 0) > 0) {
+      sum(pred_class == 0 & y_true == 0) / sum(y_true == 0)
+    } else NA
+    c(AUC = auc_val, accuracy = accuracy_val, sensitivity = sensitivity_val, specificity = specificity_val)
+  }
+  
+  if (use_elastic_net) {
+    pred_train <- pred_fn(model, X_train)
+    
+    pred_test  <- pred_fn(model, X_test)
+  } else {
+    # Use the processed predictors for predictions in the standard glm branch.
+    pred_train <- pred_fn(model, train_processed)
+    pred_test  <- pred_fn(model, test_processed)
+  }
+  
+  metrics_train <- compute_logistic_metrics(y_train, pred_train)
+  metrics_test  <- compute_logistic_metrics(y_test, pred_test)
+  
+  perf_df <- data.frame(
+    type         = c("train", "test"),
+    model        = model_name,
+    AUC          = c(metrics_train["AUC"], metrics_test["AUC"]),
+    accuracy     = c(metrics_train["accuracy"], metrics_test["accuracy"]),
+    sensitivity  = c(metrics_train["sensitivity"], metrics_test["sensitivity"]),
+    specificity  = c(metrics_train["specificity"], metrics_test["specificity"]),
+    stringsAsFactors = FALSE
+  )
+  
+  # ---------------------------
+  # 6. Compute SHAP Scores on the Training Set using fastshap with Parallelization
+  # ---------------------------
+  if (use_elastic_net) {
+    X_shap <- as.data.frame(X_train)
+    obs_ids <- 1:nrow(X_train)
+  } else {
+    X_shap <- train_processed  # use processed predictors for consistency
+    obs_ids <- 1:nrow(train_processed)
+  }
+  
+  if (!is.null(shap_subsample)) {
+    set.seed(123)
+    sampled_indices <- sample(nrow(X_shap), size = shap_subsample)
+    X_shap <- X_shap[sampled_indices, , drop = FALSE]
+    obs_ids <- sampled_indices
+  }
+  
+  # Set up a parallel backend using doParallel.
+  cl <- parallel::makeCluster(ncores)
+  doParallel::registerDoParallel(cl)
+  parallel::clusterEvalQ(cl, {
+    library(glmnet)
+    library(pROC)
+  })
+  
+  shap_scores <- fastshap::explain(
+    object = model,
+    X = X_shap,
+    pred_wrapper = pred_fn,
+    nsim = nsim,
+    parallel = TRUE
+  )
+  
+  parallel::stopCluster(cl)
+  
+  # Append observation IDs for clarity.
+  shap_scores <- cbind(obs_id = obs_ids, shap_scores)
+  
+  # ---------------------------
+  # 7. Return the Results
+  # ---------------------------
+  return(list(
+    shap_scores = shap_scores,
+    metrics     = perf_df,
+    best_config = best_config
+  ))
+}
+
+
+
+
+```
+
+
+
+# Fitbit
+```{r, warning=FALSE}
+# For combined data, run the Logistic_search_tt_shap_iml function for each condition on comb_class:
+fitbit_nw_nonen <- Logistic_search_tt_shap_iml(fitbit_class, target = "is_SI", weights = FALSE, 
+                                               use_elastic_net = FALSE, model_name = "fitbit_nw_nonen")
+fitbit_nw_en    <- Logistic_search_tt_shap_iml(fitbit_class, target = "is_SI", weights = FALSE, 
+                                               use_elastic_net = TRUE, model_name = "fitbit_nw_en",
+                                               alpha = Logistic_fitbit_nw_opt$optimal_hyperparams$alpha, lambda = Logistic_fitbit_nw_opt$optimal_hyperparams$lambda)
+fitbit_w_nonen  <- Logistic_search_tt_shap_iml(fitbit_class, target = "is_SI", weights = TRUE, 
+                                               use_elastic_net = FALSE, model_name = "fitbit_w_nonen")
+fitbit_w_en     <- Logistic_search_tt_shap_iml(fitbit_class, target = "is_SI", weights = TRUE, 
+                                               use_elastic_net = TRUE, model_name = "fitbit_w_en",
+                                               alpha = Logistic_fitbit_w_opt$optimal_hyperparams$alpha, lambda = Logistic_fitbit_w_opt$optimal_hyperparams$lambda)
+```
+
+
+# comb
+```{r, warning=FALSE}
+
+comb_class_model <- comb_class %>% filter(Race != "Native Hawaiian or Other Pacific Islander")
+
+# For combined data, run the Logistic_search_tt_shap_iml function for each condition on comb_class:
+comb_nw_nonen <- Logistic_search_tt_shap_iml(comb_class_model, target = "is_SI", weights = FALSE, 
+                                               use_elastic_net = FALSE, model_name = "comb_nw_nonen")
+comb_nw_en    <- Logistic_search_tt_shap_iml(comb_class_model, target = "is_SI", weights = FALSE, 
+                                               use_elastic_net = TRUE, model_name = "comb_nw_en",
+                                               alpha = Logistic_comb_nw_opt$optimal_hyperparams$alpha, lambda = Logistic_comb_nw_opt$optimal_hyperparams$lambda)
+comb_w_nonen  <- Logistic_search_tt_shap_iml(comb_class_model, target = "is_SI", weights = TRUE, 
+                                               use_elastic_net = FALSE, model_name = "comb_w_nonen")
+comb_w_en     <- Logistic_search_tt_shap_iml(comb_class_model, target = "is_SI", weights = TRUE, 
+                                               use_elastic_net = TRUE, model_name = "comb_w_en",
+                                               alpha = Logistic_comb_w_opt$optimal_hyperparams$alpha, lambda = Logistic_comb_nw_opt$optimal_hyperparams$lambda)
+
+```
+
+
+```{r}
+# ----- SAVE SHAP SCORES -----
+
+# For Fitbit models
+write.table(fitbit_nw_nonen$shap_scores, file = "SHAP/fitbit_class_nw_nonen_SHAP.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(fitbit_nw_en$shap_scores,    file = "SHAP/fitbit_class_nw_en_SHAP.tsv",    sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(fitbit_w_nonen$shap_scores,  file = "SHAP/fitbit_class_w_nonen_SHAP.tsv",  sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(fitbit_w_en$shap_scores,     file = "SHAP/fitbit_class_w_en_SHAP.tsv",     sep = "\t", row.names = FALSE, quote = FALSE)
+
+
+# For comb models
+write.table(comb_nw_nonen$shap_scores, file = "SHAP/comb_class_nw_nonen_SHAP.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(comb_nw_en$shap_scores,    file = "SHAP/comb_class_nw_en_SHAP.tsv",    sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(comb_w_nonen$shap_scores,  file = "SHAP/comb_class_w_nonen_SHAP.tsv",  sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(comb_w_en$shap_scores,     file = "SHAP/comb_class_w_en_SHAP.tsv",     sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+```{r}
+class_perf <- rbind(
+  fitbit_nw_nonen$metrics,
+  fitbit_nw_en$metrics,
+  fitbit_w_nonen$metrics,
+  fitbit_w_en$metrics,
+  comb_nw_nonen$metrics,
+  comb_nw_en$metrics,
+  comb_w_nonen$metrics,
+  comb_w_en$metrics
+)
+
+write.table(class_perf, file="results/class_perf.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+```
+
+

@@ -1,0 +1,398 @@
+```{r}
+library(tidyverse)      # data wrangling and plotting
+library(stringr)        # for string manipulation
+library(ggforestplot)
+library(ggforce)
+library(patchwork)
+
+# Models Directories
+CNN_DIR <- "../CNN/results"
+LSTM_DIR <- "../LSTM/results"
+OLS_DIR <- "../OLS/results"
+
+PLOTS_DIR <- "../../figures/modeling/val_forest_plots"
+```
+
+# Helper Functions for Regression
+```{r}
+# Helper function to preproces lr results
+pp_lr_r <- function(df){
+  df <- df %>% 
+  mutate(
+    Data = ifelse(str_detect(Data ,"^fit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(Model, "nw_"), "No Weight", "Weight"),
+    Model = ifelse(str_detect(Model, "nen"), "LR", "Elastic Net LR"))
+  return(df)
+}
+
+# Helper Function to preprocess neural network results
+pp_nn_r <- function(df, name, w_type){
+  df <- df %>% 
+    mutate(
+    Data = ifelse(str_detect(model, "fitbit"), "fitbit", "comb"),
+    Weight = ifelse((str_detect(model, "weighted") & (w_type == "base")) | (!str_detect(model, "nw") & (w_type == "best")) , "Weight", "No Weight"),
+    Model = name) %>%
+    rename(MSE = mse) %>% select(-model)
+  return(df)
+}
+
+```
+
+
+# Extract regression validation results
+```{r}
+OLS_reg <- read_tsv(paste0(OLS_DIR, "/val_reg_df.tsv"), show_col_types = F) %>% pp_lr_r()
+
+CNN_base_reg <- read_tsv(paste0(CNN_DIR, "/reg_base_val_learner.tsv"), show_col_types = F) %>% pp_nn_r(., "CNN_base", "base")
+CNN_best_reg <- read_tsv(paste0(CNN_DIR, "/best_val_perf_reg.tsv"), show_col_types = F) %>% pp_nn_r(., "CNN_best", "best")
+
+LSTM_base_reg <- read_tsv(paste0(LSTM_DIR, "/reg_base_val_learner.tsv"), show_col_types = F) %>% pp_nn_r(., "LSTM_base", "base")
+LSTM_best_reg <- read_tsv(paste0(LSTM_DIR, "/best_val_perf_reg.tsv"), show_col_types = F) %>% pp_nn_r(., "LSTM_best", "best")
+
+
+val_reg <- rbind(
+  OLS_reg,
+  CNN_base_reg,
+  CNN_best_reg,
+  LSTM_base_reg,
+  LSTM_best_reg
+)
+
+
+val_reg <- val_reg %>%
+  # Pivot longer on the metric columns: "1", "2", "3", "4", "5", "overall" and "MSE"
+  pivot_longer(
+    cols = c("1", "2", "3", "4", "5", "overall", "MSE"),
+    names_to = "metric",
+    values_to = "values"
+  ) %>% 
+  # First, summarize the MSE by group (if needed)
+  group_by(Data, Model, Weight, stat, metric) %>%
+  summarize(values = mean(values), .groups = "drop") %>% 
+  # Pivot wider so that the 'stat' variable gives you the column names
+  pivot_wider(
+    id_cols = c(Data, Model, Weight, metric),
+    names_from = stat,
+    values_from = values
+  ) %>% 
+  mutate(Model = factor(Model, levels = c(
+    "LR", "Elastic Net LR", "CNN_base", 
+    "CNN_best", "LSTM_base", "LSTM_best"
+  ))) %>% 
+  arrange(Model)
+
+
+val_reg
+
+```
+
+```{r}
+plot_val_forest <- function(val_reg, plot_name, title, x_max, file_name) {
+  # Ensure Weight is a factor and Model is in proper order.
+  val_reg <- val_reg %>%
+    mutate(
+      Weight = factor(Weight, levels = c("No Weight", "Weight")),
+      Model  = factor(Model, levels = unique(Model))
+    )
+  
+  # Create the forest plot using the forestplot function.
+  p <- forestplot(
+    df       = val_reg,
+    name     = Model,    # Use Model for the y-axis labels.
+    estimate = mean,     # The effect size.
+    se       = sd,       # Using the sd column as the standard error.
+    xlab     = "Mean value (± SD)",
+    colour   = Data      # Colour points by the Data column.
+  ) +
+  labs(
+  title = title) +
+    # Facet the plot into panels based on Weight.
+    ggforce::facet_col(
+      facets = ~Weight,
+      scales = "free_y",
+      space  = "free"
+    ) +
+    # Remove any extra padding on the x-axis.
+    guides(colour = guide_legend(override.aes = list(size = 2))) +
+    scale_x_continuous(expand = c(0, 0)) +
+    # Clip the plot so that only the x-range from 0 to 20 is shown.
+    coord_cartesian(xlim = c(0, x_max))
+  
+  # Define the output directory and filename.
+  file_path <- file.path(PLOTS_DIR, paste0(file_name, ".png"))
+  
+  # Save the plot as a PNG file.
+  ggsave(filename = file_path, plot = p, width = 10, height = 8, dpi = 300)
+  
+  # Return the plot object for further use if desired.
+  return(p)
+}
+
+# Example usage:
+plot_val_forest(val_reg %>% filter(metric == "MSE"), "MSE", title = "Regresion Validation Performance(MSE)", x_max=12, file_name="reg_val")
+
+```
+
+
+```{r, fig.height=8, fig.width=10}
+
+
+# Define the function that creates and combines the plots
+plot_val_forest_sep <- function(val_reg, plot_name, x_max, file_name) {
+  
+  # 1. Ensure proper factor ordering.
+  val_reg <- val_reg %>%
+    mutate(
+      Weight = factor(Weight, levels = c("Weight", "No Weight")),
+      Data   = factor(Data, levels = c("fitbit", "comb")),
+      Model  = factor(Model, levels = unique(Model)),
+      metric = factor(metric, levels = c("1", "2", "3", "4", "5", "overall"))
+    )
+  
+  # 2. Split the data into two data frames: one for weighted and one for not weighted.
+  df_weighted     <- val_reg %>% filter(Weight == "Weight")
+  df_not_weighted <- val_reg %>% filter(Weight == "No Weight")
+  
+  # 3. Define a manual color palette for the metrics.
+  metric_colors <- c("blue", "green", "goldenrod3", "orange", "red", "black")
+  
+  # 4. Create the forest plot for NOT weighted data.
+  p_not <- forestplot(
+    df         = df_not_weighted,
+    name       = Model,     # Use Model for y-axis labels.
+    estimate   = mean,      # Use "mean" for the effect size.
+    se         = sd,        # Use "sd" for the standard error.
+    xlab       = "Mean value (± SD)",
+    colour     = metric,    # Color points by "metric".
+    point.args = list(shape = 21, color = "black")  # Use shape 21 for the points.
+  ) +
+    scale_colour_manual(values = metric_colors) +
+    labs(title = "Not Weighted") +
+    ggforce::facet_col(~ Data, scales = "free_y", space = "free") +
+    scale_x_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, x_max)) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(hjust = 0.5),
+      legend.position = "none"   # Remove legend for the left plot.
+    )
+  
+  # 5. Create the forest plot for weighted data with larger legend dots.
+  p_weight <- forestplot(
+    df         = df_weighted,
+    name       = Model,
+    estimate   = mean,
+    se         = sd,
+    xlab       = "Mean value (± SD)",
+    colour     = metric,
+    point.args = list(shape = 21, color = "black")
+  ) +
+    scale_colour_manual(values = metric_colors) +
+    # Add guides override to enlarge the dots in the legend
+    guides(colour = guide_legend(override.aes = list(size = 2))) +
+    labs(title = "Weighted") +
+    ggforce::facet_col(~ Data, scales = "free_y", space = "free") +
+    scale_x_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, 6)) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+  
+  # 6. Combine the two plots side-by-side with a centered super title.
+  combined_plot <- p_not + p_weight +
+    plot_annotation(
+      title = "Validation Metrics (RMSE)",
+      theme = theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+      )
+    )
+  
+  file_path <- file.path(PLOTS_DIR, paste0(file_name, ".png"))
+  ggsave(filename = file_path, plot = combined_plot, width = 10, height = 8, dpi = 300, units="in")
+  
+  return(combined_plot)
+}
+
+
+plot_val_forest_sep(val_reg %>% filter(metric != "MSE"), "reg_val_metrics", x_max=6, file_name="reg_val_metrics")
+
+```
+
+
+# Classification
+
+# Helper functions
+```{r}
+# Helper function to preproces lr results
+pp_lr_c <- function(df){
+  col_order <- c("stat", "accuracy", "sensitivity", "specificity", "BCE", "Data", "Weight", "Model")
+  
+  df <- df %>% 
+  mutate(
+    Data = ifelse(str_detect(Data ,"^fit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(Model, "nw_"), "No Weight", "Weight"),
+    Model = ifelse(str_detect(Model, "nen"), "LR", "Elastic Net LR")) %>% 
+  rename(BCE = binary_cross_entropy) %>%
+    select(-AUC) %>% 
+    select(all_of(col_order))
+  
+  return(df)
+}
+
+# Helper Function to preprocess neural network results
+pp_nn_c <- function(df, name, w_type){
+  col_order <- c("stat", "accuracy", "sensitivity", "specificity", "BCE", "Data", "Weight", "Model")
+  
+  df <- df %>% 
+    mutate(
+    Data = ifelse(str_detect(model, "fitbit"), "fitbit", "comb"),
+    Weight = ifelse((str_detect(model, "weighted") & (w_type == "base")) | (!str_detect(model, "nw") & (w_type == "best")) , "Weight", "No Weight"),
+    Model = name) %>% 
+    select(-c(model, AUC)) %>% 
+    select(all_of(col_order))
+  return(df)
+}
+```
+
+# Import
+
+```{r}
+OLS_class <- read_tsv(paste0(OLS_DIR, "/val_class_df.tsv"), show_col_types = F) %>% pp_lr_c()
+
+CNN_base_class <- read_tsv(paste0(CNN_DIR, "/class_base_val_learner.tsv"), show_col_types = F) %>% pp_nn_c(., "CNN_base", "base")
+CNN_best_class <- read_tsv(paste0(CNN_DIR, "/best_val_perf_class.tsv"), show_col_types = F) %>% rename(BCE = bce) %>% pp_nn_c(., "CNN_best", "best")
+
+LSTM_base_class <- read_tsv(paste0(LSTM_DIR, "/class_base_val_learner.tsv"), show_col_types = F) %>% rename(BCE = bse) %>% pp_nn_c(., "LSTM_base", "base")
+LSTM_best_class <- read_tsv(paste0(LSTM_DIR, "/best_val_perf_class.tsv"), show_col_types = F)%>% rename(BCE = bse)  %>%  pp_nn_c(., "LSTM_best", "best")
+
+OLS_class %>% colnames()    
+CNN_base_class %>% colnames()
+CNN_best_reg %>% colnames()
+LSTM_base_class %>% colnames()
+LSTM_best_class %>% colnames()
+
+
+
+val_class <- rbind(
+  OLS_class,
+  CNN_base_class,
+  CNN_best_class,
+  LSTM_base_class,
+  LSTM_best_class
+)
+
+
+
+val_class <- val_class %>%
+  # Pivot longer on the metric columns: "1", "2", "3", "4", "5", "overall" and "MSE"
+  pivot_longer(
+    cols = c("accuracy", "sensitivity", "specificity", "BCE"),
+    names_to = "metric",
+    values_to = "values"
+  ) %>% 
+  # First, summarize the MSE by group (if needed)
+  group_by(Data, Model, Weight, stat, metric) %>%
+  summarize(values = mean(values), .groups = "drop") %>% 
+  # Pivot wider so that the 'stat' variable gives you the column names
+  pivot_wider(
+    id_cols = c(Data, Model, Weight, metric),
+    names_from = stat,
+    values_from = values
+  ) %>% 
+  mutate(Model = factor(Model, levels = c(
+    "LR", "Elastic Net LR", "CNN_base", 
+    "CNN_best", "LSTM_base", "LSTM_best"
+  ))) %>% 
+  arrange(Model)
+
+```
+# BCE perf
+```{r}
+plot_val_forest(val_class %>% filter(metric == "BCE"), "BCE", title = "Classification Validation Performance(BCE)", x_max=3, file_name="class_val")
+```
+
+
+```{r, fig.height=8, fig.width=10}
+plot_class_forest_sep <- function(val_class, plot_name, x_max, file_name) {
+  
+  # 1. Ensure proper factor ordering with new metric categories.
+  val_class <- val_class %>%
+    mutate(
+      Weight = factor(Weight, levels = c("Weight", "No Weight")),
+      Data   = factor(Data, levels = c("fitbit", "comb")),
+      Model  = factor(Model, levels = unique(Model)),
+      metric = factor(metric, levels = c("accuracy", "sensitivity", "specificity"))
+    )
+  
+  # 2. Split the data into two data frames: one for weighted and one for not weighted.
+  df_weighted     <- val_class %>% filter(Weight == "Weight")
+  df_not_weighted <- val_class %>% filter(Weight == "No Weight")
+  
+  # 3. Define a manual color palette for the metrics (choose your colors here).
+  metric_colors <- c("purple", "red", "blue")
+  
+  # 4. Create the forest plot for NOT weighted data.
+  p_not <- forestplot(
+    df         = df_not_weighted,
+    name       = Model,     # Use Model for y-axis labels.
+    estimate   = mean,      # Use "mean" for the effect size.
+    se         = sd,        # Use "sd" for the standard error.
+    xlab       = "Mean value (± SD)",
+    colour     = metric,    # Color points by "metric".
+    point.args = list(shape = 21, color = "black")  # Use shape 21 for the points.
+  ) +
+    scale_colour_manual(values = metric_colors) +
+    labs(title = "Not Weighted") +
+    ggforce::facet_col(~ Data, scales = "free_y", space = "free") +
+    scale_x_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, x_max)) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(hjust = 0.5),
+      legend.position = "none"   # Remove legend for the left plot.
+    )
+  
+  # 5. Create the forest plot for weighted data with larger legend dots.
+  p_weight <- forestplot(
+    df         = df_weighted,
+    name       = Model,
+    estimate   = mean,
+    se         = sd,
+    xlab       = "Mean value (± SD)",
+    colour     = metric,
+    point.args = list(shape = 21, color = "black")
+  ) +
+    scale_colour_manual(values = metric_colors) +
+    guides(colour = guide_legend(override.aes = list(size = 2))) +
+    labs(title = "Weighted") +
+    ggforce::facet_col(~ Data, scales = "free_y", space = "free") +
+    scale_x_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, x_max)) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+  
+  # 6. Combine the two plots side-by-side with a centered super title.
+  combined_plot <- p_not + p_weight +
+    plot_annotation(
+      title = "Validation Metrics",
+      theme = theme(
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+      )
+    )
+  
+  file_path <- file.path(PLOTS_DIR, paste0(file_name, ".png"))
+  ggsave(filename = file_path, plot = combined_plot, width = 10, height = 8, dpi = 300, units = "in")
+  
+  return(combined_plot)
+}
+
+# Example function call (note that 'val_class' replaces 'val_reg' and the filename now reflects 'class'):
+plot_class_forest_sep(val_class %>% filter(metric != "BCE"), "class_val_metrics", x_max = 1, file_name="class_val_metrics")
+
+```
+

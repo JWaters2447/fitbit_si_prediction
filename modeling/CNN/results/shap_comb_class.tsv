@@ -1,0 +1,83 @@
+predictor	mean_abs_integrated_gradients	sd_abs_integrated_gradients
+BodyBmi	1.5282687e-05	0.003513131
+BodyFat	-0.00033662037	0.003131907
+BodyWeight	3.3682088e-06	0.0029940347
+CaloriesBMR	-0.00026932356	0.0032294237
+FoodCaloriesIn	-6.807657e-05	0.0036023066
+HeartRateIntradayCount	-0.00090879167	0.0030166525
+HeartRateZoneOutOfRangeCaloriesOut	-0.0001878883	0.0033282451
+HeartRateZoneOutOfRangeMax	-0.0001559818	0.0031278422
+HeartRateZoneOutOfRangeMinutes	-0.00034698425	0.0029113975
+HeartRateZoneFatBurnCaloriesOut	-0.0005703866	0.0033627576
+HeartRateZoneFatBurnMax	-0.000137416	0.0033591948
+HeartRateZoneFatBurnMinutes	-0.00043308025	0.0028634327
+HeartRateZoneCardioCaloriesOut	-0.0004856831	0.0024948907
+HeartRateZoneCardioMax	0.00041768842	0.0029653995
+HeartRateZoneCardioMinutes	-0.00022061437	0.0027363412
+HeartRateZonePeakCaloriesOut	-0.0003428054	0.0038255507
+HeartRateZonePeakMinutes	-0.00019292733	0.0031578366
+TrackerActivityCalories	-0.00034298009	0.0026518714
+TrackerCalories	-9.954465e-05	0.0034167038
+TrackerDistance	-0.00041821858	0.0031368532
+TrackerElevation	-0.00033375976	0.0023659903
+TrackerMinutesFairlyActive	-0.0003560689	0.0024568099
+TrackerMinutesLightlyActive	-0.000535353	0.003118041
+TrackerMinutesSedentary	-0.00016121857	0.0028064614
+TrackerMinutesVeryActive	-0.00013980475	0.0023539162
+TrackerSteps	-0.00079540396	0.0032775921
+Water	-0.00010869724	0.0034902785
+skipped	-0.00023055743	0.0019787936
+Efficiency	-5.3607215e-05	0.0024772973
+SleepLevelDeep	0.00023260758	0.00247101
+SleepLevelLight	-0.000208101	0.002304351
+SleepLevelRem	-0.00022397033	0.0024727539
+SleepLevelWake	0.00034732083	0.0026415952
+MinutesAfterWakeup	-0.0002822153	0.0031904387
+MinutesAsleep	-0.0002234903	0.0022388601
+MinutesAwake	-0.00032527474	0.0027126295
+MinutesToFallAsleep	-0.00026192598	0.0035455292
+TimeInBed	-0.00025153375	0.002134698
+times_slept	-0.0012311636	0.004098025
+age	-0.00036189012	0.0029218385
+Race_American Indian/Alaska Native	-9.585837e-06	0.0004268205
+Race_Asian	6.6183275e-05	0.0009392842
+Race_Black or African American	-0.00016887317	0.0010792569
+Race_Native Hawaiian or Other Pacific Islander	-5.721202e-08	0.0001379193
+Race_Prefer not to answer	1.3120933e-05	0.00040110498
+Race_Something else	-2.1816812e-05	0.00074664387
+Race_White	-0.0034566072	0.002974389
+isHispanic_No	0.00038544484	0.0023822112
+isHispanic_Yes	-1.5021558e-05	0.0009237336
+Relationship_Status_Divorced or separated	3.455445e-05	0.0009918219
+Relationship_Status_In a committed relationship but not married	-0.00049277855	0.0020285172
+Relationship_Status_Married	-0.0019879646	0.0033033774
+Relationship_Status_Prefer not to answer	1.6464433e-06	0.00022665788
+Relationship_Status_Single	0.00025480188	0.0020603098
+Relationship_Status_Widowed	5.61796e-06	0.0004938821
+education_Associate degree	0.00014240925	0.0012892848
+education_Bachelor's degree	-0.00067381695	0.0022768148
+education_Doctorate degree	-0.00027871405	0.0014047376
+education_High school graduate or GED	0.00022961291	0.0014331505
+education_Less than a high school diploma	1.4699606e-05	0.0006039673
+education_Master's degree	-0.00092118303	0.0023983705
+education_Some college credit, no degree	0.0004101769	0.0019318219
+education_Trade/technical/vocational training	-3.7983664e-05	0.00071071717
+employment_Full-time employment	-0.0022490125	0.003369743
+employment_Part-time employment	0.0001293843	0.0017167773
+employment_Retired	-0.00042582647	0.0017378625
+employment_Student	-6.862462e-06	0.0013890556
+employment_Unemployed	0.00019330102	0.0017035657
+sex_female	-0.0026361344	0.0030895404
+sex_male	0.00025355545	0.0017149647
+gender_Female	-0.002455161	0.002845736
+gender_Male	-0.00029483385	0.0018047577
+gender_Non-binary	0.00013894534	0.0009408965
+gender_Prefer not to answer	-4.65867e-06	0.0003148358
+gender_Trans female	1.2029768e-05	0.00032974125
+gender_Trans male	8.4252486e-07	0.00027760424
+sexuality_Bisexual	0.00091453607	0.002414057
+sexuality_Gay or lesbian	-7.194143e-05	0.001033831
+sexuality_Heterosexual	-0.004156077	0.0036746715
+sexuality_Prefer not to answer	-1.4687635e-05	0.0006250252
+sexuality_Something else	0.00019645	0.0011603788
+mask_time	0.0	0.0

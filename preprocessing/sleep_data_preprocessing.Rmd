@@ -1,0 +1,475 @@
+```{r}
+library(tidyverse)        # For Generic data wrangling
+library(data.table)       # For efficient data wrangling
+library(lubridate)        # For working with date times
+library(naniar)           # For MCAR test
+library(DirichletReg)     # For Dirchlet Imputation
+library(caret)            # K-folds cross validation
+library(readr)            # For working with tsv
+library(parallel)         # Multiprocessing for cross-validation
+
+setwd("/home/jeffrw/BIOSTAT629/main_project/preprocessing")
+```
+
+# Helper Functions
+```{r}
+load_data <- function(dir){
+  # Helper function to load in data set and append headers
+  header_file <- paste0(dir, ".rpt")
+  headers <- readLines(header_file, n = 1)
+  
+  headers <- strsplit(headers, "\\s+") %>% unlist()
+  
+  data_file <- paste0(dir, ".txt")
+  data <- read.table(data_file, sep="\t", header=F)
+  
+  colnames(data) <- headers
+  
+  return(data)
+}
+
+```
+
+# Load Data and cleaned survey data
+```{r}
+sleep_data_o <- load_data("../data/raw/Fitbit_sleep")
+survey_data <- read_tsv("../data/intermediate/survey_data.tsv", show_col_types = F)
+```
+
+# Step 1: Basic modifications
+```{r}
+# Remove unnecessary columns
+sleep_data <- sleep_data_o %>% select(-c(InfoCode, EndDate, Type))
+
+# Convert to data.table
+setDT(sleep_data)
+
+# Convert StartDate to POSIXct and rename to Date
+sleep_data[, StartDate := as.POSIXct(StartDate, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+sleep_data <- sleep_data %>%
+  mutate(Duration = Duration / (60 * 60 * 1000)) %>% 
+  rename(Date = StartDate)
+
+# Ensure Date is in proper format for aggregation
+sleep_data[, Date := as.Date(Date)]
+
+
+```
+
+# Step 2a: convert sleep's vars to numeric, replace NULL with NA
+```{r}
+# Identify numeric columns to convert
+sleep_stage_cols <- c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")
+
+# Replace "NULL" (with any whitespace) with NA across ALL columns
+sleep_data[, (names(sleep_data)) := lapply(.SD, function(x) {
+  fifelse(str_detect(as.character(x), "^\\s*NULL\\s*$"), NA, x)
+}), .SDcols = names(sleep_data)]
+
+# Convert sleep stage columns to numeric
+sleep_data[, (sleep_stage_cols) := lapply(.SD, as.numeric), .SDcols = sleep_stage_cols]
+
+# Convert TimeInBed to numeric
+sleep_data[, TimeInBed := as.numeric(TimeInBed)]
+
+```
+
+# Step 3 Perform conditional mean imputation via Dirchlet regression
+
+# Assess imputation performance
+```{r}
+dirichlet_evaluation_mp <- function(input_data, k_folds = 5) {
+
+  data <- copy(input_data)
+  
+  # 1) Identify predictor variables to scale (excluding Duration)
+  predictor_vars <- c("Efficiency", "MinutesAfterWakeup", "MinutesAsleep", 
+                      "MinutesAwake", "MinutesToFallAsleep")
+  
+  # 2) Scale predictor variables BEFORE splitting
+  data[, (predictor_vars) := lapply(.SD, scale), .SDcols = predictor_vars]
+  
+  # Convert rows with all-zero sleep levels to NA
+  zero_sleep_rows <- data[, .(SleepLevelDeep, SleepLevelLight, SleepLevelRem, SleepLevelWake)] %>% 
+    as.matrix() %>% 
+    apply(1, function(x) all(x == 0))
+  data[zero_sleep_rows, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake") := NA]
+  
+  # 3) Identify rows with missing sleep stage values
+  mis_index <- data %>% is.na() %>% apply(MARGIN = 1, FUN = any)
+  
+  # 4) Split into complete & incomplete sets
+  incomplete <- data[mis_index, ]
+  complete <- data[!mis_index, ]
+  
+  # 5) Compute Sleep Stage Proportions
+  complete <- complete %>%
+    mutate(
+      prop_Deep  = SleepLevelDeep / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+      prop_Light = SleepLevelLight / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+      prop_REM   = SleepLevelRem / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+      prop_Wake  = SleepLevelWake / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake)
+    )
+  
+  # 6) Convert Proportions Back to Minutes to Match TimeInBed
+  complete <- complete %>%
+    mutate(
+      SleepLevelDeep  = prop_Deep * TimeInBed,
+      SleepLevelLight = prop_Light * TimeInBed,
+      SleepLevelRem   = prop_REM * TimeInBed,
+      SleepLevelWake  = prop_Wake * TimeInBed
+    ) %>% select(-c(prop_Deep, prop_Light, prop_REM, prop_Wake))
+  
+  # 7) Convert Proportions to Dirichlet Format (for training the model)
+  DV <- DR_data(complete[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")])
+  
+  # 7.5) Compute standard deviations for each sleep variable in the complete set (for nRMSE)
+  sleep_vars <- c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")
+  sd_sleep <- sapply(complete[, sleep_vars, with = FALSE], sd, na.rm = TRUE)
+  
+  set.seed(123)
+  
+  # 8) Perform k-folds cross-validation on PatientID level
+  unique_patients <- unique(complete$PatientID)
+  folds <- createFolds(unique_patients, k = k_folds, list = TRUE)
+  
+  # Process folds in parallel (one core per fold)
+  fold_results <- mclapply(seq_along(folds), function(i) {
+    test_patients <- unique_patients[folds[[i]]]
+    train_set <- complete[!(PatientID %in% test_patients), ]
+    test_set  <- complete[(PatientID %in% test_patients), ]
+    
+    # Remove rows with missing sleep levels in the test set
+    test_set <- test_set[complete.cases(test_set[, sleep_vars, with = FALSE]), ]
+    
+    cat(sprintf("\nStarting Fold %d/%d | Training Size: %d | Testing Size: %d\n", 
+                i, k_folds, nrow(train_set), nrow(test_set)))
+    
+    if(nrow(test_set) == 0) {
+      cat("   No complete test data for this fold. Skipping...\n")
+      return(NULL)
+    }
+    
+    DV_train <- DR_data(train_set[, sleep_vars, with = FALSE])
+    DV_test  <- DR_data(test_set[, sleep_vars, with = FALSE])
+    
+    # Train Dirichlet Model
+    cat("   Training Dirichlet Model...\n")
+    dirichlet_model <- DirichReg(
+      DV_train ~ Efficiency + MinutesAfterWakeup + MinutesAsleep +
+                 MinutesAwake + MinutesToFallAsleep,
+      data = train_set
+    )
+    
+    # Make predictions
+    cat("   Making Predictions...\n")
+    predicted <- predict(dirichlet_model, newdata = test_set, type = "response")
+    
+    # Convert responses to matrices for per-variable calculations
+    DV_test_mat <- as.matrix(DV_test)
+    predicted_mat <- as.matrix(predicted)
+    
+    # Compute RMSE for each sleep variable in this fold
+    rmse_fold <- sqrt(colMeans((DV_test_mat - predicted_mat)^2))
+    nrmse_fold <- rmse_fold / sd_sleep[sleep_vars]
+    
+    return(list(rmse = rmse_fold, nrmse = nrmse_fold))
+    
+  }, mc.cores = min(k_folds, detectCores()))
+  
+  # Remove any skipped folds (NULL results)
+  fold_results <- Filter(Negate(is.null), fold_results)
+  
+  # 9) For each sleep variable, compute the mean and SD across folds for RMSE and nRMSE
+  agg_rmse_mean <- sapply(sleep_vars, function(var) {
+    vals <- sapply(fold_results, function(x) x$rmse[[var]])
+    mean(vals, na.rm = TRUE)
+  })
+  agg_rmse_sd <- sapply(sleep_vars, function(var) {
+    vals <- sapply(fold_results, function(x) x$rmse[[var]])
+    sd(vals, na.rm = TRUE)
+  })
+  
+  agg_nrmse_mean <- sapply(sleep_vars, function(var) {
+    vals <- sapply(fold_results, function(x) x$nrmse[[var]])
+    mean(vals, na.rm = TRUE)
+  })
+  agg_nrmse_sd <- sapply(sleep_vars, function(var) {
+    vals <- sapply(fold_results, function(x) x$nrmse[[var]])
+    sd(vals, na.rm = TRUE)
+  })
+  
+  # 10) Compute overall mean and SD across variables (using the per-variable means)
+  overall_mean_rmse <- mean(agg_rmse_mean, na.rm = TRUE)
+  overall_sd_rmse   <- sd(agg_rmse_mean, na.rm = TRUE)
+  
+  overall_mean_nrmse <- mean(agg_nrmse_mean, na.rm = TRUE)
+  overall_sd_nrmse   <- sd(agg_nrmse_mean, na.rm = TRUE)
+  
+  cat(sprintf("\nOverall RMSE: Mean = %.5f, SD = %.5f\n", overall_mean_rmse, overall_sd_rmse))
+  cat(sprintf("Overall nRMSE: Mean = %.5f, SD = %.5f\n", overall_mean_nrmse, overall_sd_nrmse))
+  
+  # 11) Compute total missing counts and missing proportions from the input data
+  missing_counts <- sapply(data[, sleep_vars, with = FALSE], function(x) sum(is.na(x)))
+  missing_prop   <- sapply(data[, sleep_vars, with = FALSE], function(x) mean(is.na(x)))
+  
+  # 12) Prepare a results data frame with per-variable metrics
+  results_df <- data.frame(
+    variable = sleep_vars,
+    total_missing = missing_counts,
+    proportion_missing = missing_prop,
+    rmse_mean = agg_rmse_mean,
+    rmse_sd = agg_rmse_sd,
+    nrmse_mean = agg_nrmse_mean,
+    nrmse_sd = agg_nrmse_sd,
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(details = results_df,
+              overall_mean_rmse = overall_mean_rmse,
+              overall_sd_rmse = overall_sd_rmse,
+              overall_mean_nrmse = overall_mean_nrmse,
+              overall_sd_nrmse = overall_sd_nrmse))
+}
+
+# Example usage:
+results <- dirichlet_evaluation_mp(sleep_data, k_folds = 5)
+print(results$details)
+cat("Overall RMSE: Mean =", results$overall_mean_rmse, "SD =", results$overall_sd_rmse, "\n")
+cat("Overall nRMSE: Mean =", results$overall_mean_nrmse, "SD =", results$overall_sd_nrmse, "\n")
+
+
+# Overall RMSE: Mean = 0.05432, SD = 0.02832
+# Overall nRMSE: Mean = 0.00133, SD = 0.00048
+# > print(results$details)
+# > cat("Overall RMSE: Mean =", results$overall_mean_rmse, "SD =", results$overall_sd_rmse, "\n")
+# Overall RMSE: Mean = 0.05431858 SD = 0.02831927 
+# > cat("Overall nRMSE: Mean =", results$overall_mean_nrmse, "SD =", results$overall_sd_nrmse, "\n")
+# Overall nRMSE: Mean = 0.001325677 SD = 0.0004830963 
+```
+# Impute the data
+```{r}
+dirichlet_imputation <- function(data) {
+  
+  # 1) Identify predictor variables to scale (excluding Duration)
+  predictor_vars <- c("Efficiency", "MinutesAfterWakeup", "MinutesAsleep", 
+                      "MinutesAwake", "MinutesToFallAsleep")
+
+  # 2) Save original predictor values before scaling
+  original_predictors <- data[, ..predictor_vars]
+
+  # 3) Scale predictor variables **for modeling only**
+  data[, (predictor_vars) := lapply(.SD, scale), .SDcols = predictor_vars]
+
+  # Convert rows with all-zero sleep levels to NA
+  zero_sleep_rows <- data[, .(SleepLevelDeep, SleepLevelLight, SleepLevelRem, SleepLevelWake)] %>% 
+    apply(1, function(x) all(x == 0))  
+
+  data[zero_sleep_rows, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake") := NA]
+
+  # 4) Identify rows with missing sleep stage values
+  mis_index <- data %>% is.na() %>% apply(MARGIN = 1, FUN = any)
+
+  # 5) Split into complete & incomplete sets
+  incomplete <- data[mis_index, ]
+  complete <- data[!mis_index, ]
+
+  # 6) Compute Sleep Stage Proportions
+  complete <- complete %>%
+    mutate(
+      prop_Deep  = SleepLevelDeep / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+      prop_Light = SleepLevelLight / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+      prop_REM   = SleepLevelRem / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+      prop_Wake  = SleepLevelWake / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake)
+    )
+
+  # 7) Convert Proportions Back to Minutes to Match TimeInBed
+  complete <- complete %>%
+    mutate(
+      SleepLevelDeep  = prop_Deep * TimeInBed,
+      SleepLevelLight = prop_Light * TimeInBed,
+      SleepLevelRem   = prop_REM * TimeInBed,
+      SleepLevelWake  = prop_Wake * TimeInBed
+    ) %>% select(-c(prop_Deep, prop_Light, prop_REM, prop_Wake))  # Drop temp columns
+
+  # 8) Convert Proportions to Dirichlet Format
+  DV <- DR_data(complete[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")])
+
+  # 9) Train Dirichlet Model on the FULL Complete Data
+  cat("\nTraining Dirichlet Model on full dataset...\n")
+  dirichlet_model <- DirichReg(
+    DV ~ Efficiency + MinutesAfterWakeup + MinutesAsleep +
+           MinutesAwake + MinutesToFallAsleep,
+    data = complete
+  )
+
+  # 10) Impute Missing Data for Incomplete Subjects
+  cat("\nImputing missing sleep data for incomplete subjects...\n")
+  
+  # Predict proportions for incomplete cases
+  predicted_proportions <- predict(dirichlet_model, newdata = incomplete, type = "response")
+
+  # Ensure `predicted_proportions` is a data.table with correct column names
+  predicted_proportions <- as.data.table(predicted_proportions)
+  setnames(predicted_proportions, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake"))
+
+  # Convert Predicted Proportions to Actual Sleep Stage Minutes
+  incomplete[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")] <- 
+    predicted_proportions * incomplete$TimeInBed
+
+  # Merge imputed data with complete data
+  final_data <- rbind(complete, incomplete)
+
+  # 11) Restore Original (Unscaled) Predictor Values
+  final_data[, (predictor_vars) := original_predictors]
+
+  return(final_data)  # Return dataset with imputed values & unscaled predictors
+}
+
+# Run Function
+imputed_sleep_data <- dirichlet_imputation(sleep_data)
+```
+
+
+
+
+# OLD MAE validation
+```{r}
+# dirichlet_evaluation <- function(input_data, k_folds = 5) {
+#   
+#   data <- copy(input_data)
+#   
+#   # 1) Identify predictor variables to scale (excluding Duration)
+#   predictor_vars <- c("Efficiency", "MinutesAfterWakeup", "MinutesAsleep", 
+#                       "MinutesAwake", "MinutesToFallAsleep")
+# 
+#   # 2) Scale predictor variables **before splitting**
+#   data[, (predictor_vars) := lapply(.SD, scale), .SDcols = predictor_vars]
+# 
+#   # Convert rows with all-zero sleep levels to NA
+#   zero_sleep_rows <- data[, .(SleepLevelDeep, SleepLevelLight, SleepLevelRem, SleepLevelWake)] %>% 
+#     apply(1, function(x) all(x == 0))  
+# 
+#   data[zero_sleep_rows, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake") := NA]
+# 
+#   # 3) Identify rows with missing sleep stage values
+#   mis_index <- data %>% is.na() %>% apply(MARGIN = 1, FUN = any)
+# 
+#   # 4) Split into complete & incomplete sets
+#   incomplete <- data[mis_index, ]
+#   complete <- data[!mis_index, ]
+# 
+#   # 5) Compute Sleep Stage Proportions
+#   complete <- complete %>%
+#     mutate(
+#       prop_Deep  = SleepLevelDeep / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+#       prop_Light = SleepLevelLight / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+#       prop_REM   = SleepLevelRem / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake),
+#       prop_Wake  = SleepLevelWake / (SleepLevelDeep + SleepLevelLight + SleepLevelRem + SleepLevelWake)
+#     )
+# 
+#   # 6) Convert Proportions Back to Minutes to Match TimeInBed
+#   complete <- complete %>%
+#     mutate(
+#       SleepLevelDeep  = prop_Deep * TimeInBed,
+#       SleepLevelLight = prop_Light * TimeInBed,
+#       SleepLevelRem   = prop_REM * TimeInBed,
+#       SleepLevelWake  = prop_Wake * TimeInBed
+#     ) %>% select(-c(prop_Deep, prop_Light, prop_REM, prop_Wake))  # Drop temp columns
+# 
+#   # 7) Convert Proportions to Dirichlet Format
+#   DV <- DR_data(complete[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")])
+# 
+#   set.seed(123)
+# 
+#   # 8) Perform k-folds cross-validation **on PatientID level**
+#   unique_patients <- unique(complete$PatientID)
+#   folds <- createFolds(unique_patients, k = k_folds, list = TRUE)
+# 
+#   # Store MAE results
+#   mae_values <- numeric(k_folds)
+# 
+#   for (i in seq_along(folds)){
+#     # Get patient IDs for this fold
+#     test_patients <- unique_patients[folds[[i]]]
+#     
+#     # Ensure all rows from these patients go into the test set
+#     train_set <- complete[!(PatientID %in% test_patients), ]
+#     test_set  <- complete[(PatientID %in% test_patients), ]
+# 
+#     # Remove rows where sleep levels are missing in the test set (to ensure fair evaluation)
+#     test_set <- test_set[complete.cases(test_set[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")]), ]
+# 
+#     # Print fold info: training & testing sizes
+#     cat(sprintf("\nStarting Fold %d/%d | Training Size: %d | Testing Size: %d\n", 
+#                 i, k_folds, nrow(train_set), nrow(test_set)))
+# 
+#     # Skip fold if no complete test data
+#     if (nrow(test_set) == 0) {
+#       cat("   No complete test data for this fold. Skipping...\n")
+#       next
+#     }
+# 
+#     DV_train <- DR_data(train_set[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")])
+#     DV_test <- DR_data(test_set[, c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")])
+# 
+#     # Train Dirichlet Model
+#     cat("   Training Dirichlet Model...\n")
+#     dirichlet_model <- DirichReg(
+#       DV_train ~ Efficiency + MinutesAfterWakeup + MinutesAsleep +
+#              MinutesAwake + MinutesToFallAsleep,
+#       data = train_set
+#     )
+# 
+#     # Make predictions
+#     cat("   Making Predictions...\n")
+#     predicted <- predict(dirichlet_model, newdata = test_set, type = "response")
+# 
+#     # Compute Mean Absolute Error (MAE)
+#     mae_values[i] <- mean(abs(as.matrix(DV_test) - predicted))
+# 
+#     cat(sprintf("   Fold %d MAE: %.5f\n", i, mae_values[i]))
+#   }
+# 
+#   # Compute Overall MAE
+#   overall_mae <- mean(mae_values, na.rm = TRUE)
+#   overall_mae_sd <- sd(mae_values, na.rm = TRUE)
+#   cat(sprintf("\nOverall Mean Absolute Error (MAE): %.5f ± %.5f\n", overall_mae, overall_mae_sd))
+# }
+# 
+# dirichlet_evaluation(sleep_data, k_folds = 5)
+```
+
+
+
+# Aggregate sleep_data and imputed and save
+```{r}
+# Function to Aggregate Sleep Data
+aggregate_sleep_data <- function(data) {
+  data_aggregated <- data[, .(
+    Efficiency = mean(Efficiency, na.rm = TRUE),  # Aggregate Efficiency by mean
+    SleepLevelDeep = sum(SleepLevelDeep, na.rm = TRUE),
+    SleepLevelLight = sum(SleepLevelLight, na.rm = TRUE),
+    SleepLevelRem = sum(SleepLevelRem, na.rm = TRUE),
+    SleepLevelWake = sum(SleepLevelWake, na.rm = TRUE),
+    MinutesAfterWakeup = sum(MinutesAfterWakeup, na.rm = TRUE),
+    MinutesAsleep = sum(MinutesAsleep, na.rm = TRUE),
+    MinutesAwake = sum(MinutesAwake, na.rm = TRUE),
+    MinutesToFallAsleep = sum(MinutesToFallAsleep, na.rm = TRUE),
+    TimeInBed = sum(TimeInBed, na.rm = TRUE),
+    times_slept = .N  # Count the number of times a person slept in a day
+  ), by = .(PatientID, Date)]  # Group by PatientID and Date
+
+  return(data_aggregated)
+}
+
+# Aggregate original and imputed sleep data
+aggregated_sleep_data <- aggregate_sleep_data(sleep_data)
+aggregated_imputed_sleep_data <- aggregate_sleep_data(imputed_sleep_data)
+
+# Save the aggregated datasets
+write_tsv(aggregated_sleep_data, "../data/intermediate/sleep_data.tsv")
+write_tsv(aggregated_imputed_sleep_data, "../data/intermediate/imputed_sleep_data.tsv")
+```
+
+

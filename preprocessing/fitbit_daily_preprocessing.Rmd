@@ -1,0 +1,284 @@
+```{r}
+library(tidyverse)        # For Generic data wrangling
+library(data.table)       # For efficient data wrangling
+library(lubridate)        # For working with date times
+library(naniar)           # For MCAR test
+library(mice)             # For conditional mean imputation (daily data)
+library(readr)            # For working with tsv
+
+setwd("/home/jeffrw/BIOSTAT629/main_project/preprocessing")
+```
+
+# Helper Functions
+```{r}
+load_data <- function(dir){
+  # Helper function to load in data set and append headers
+  header_file <- paste0(dir, ".rpt")
+  headers <- readLines(header_file, n = 1)
+  
+  headers <- strsplit(headers, "\\s+") %>% unlist()
+  
+  data_file <- paste0(dir, ".txt")
+  data <- read.table(data_file, sep="\t", header=F)
+  
+  colnames(data) <- headers
+  
+  return(data)
+}
+
+```
+
+# Load Data and cleaned survey data
+```{r}
+daily_data_o <- load_data("../data/raw/Fitbit_Daily")
+survey_data <- read_tsv("../data/intermediate/survey_data.tsv", show_col_types = F)
+```
+
+# Fitbit Daily data
+```{r}
+# Remove ModifiedDate column
+daily_data <- daily_data_o %>% select(-ModifiedDate)
+
+
+# Convert to data.table for performance boost
+setDT(daily_data)
+
+# Process Date column efficiently
+daily_data[, Date := as.Date(ymd_hms(Date))]  # Convert Date to day-level format
+
+# Identify columns to convert (excluding ID & Date)
+cols_to_convert <- setdiff(names(daily_data), c("PatientID", "Date"))
+
+# Efficiently replace "NULL" (anywhere in the string) with NA and convert to numeric
+daily_data[, (cols_to_convert) := lapply(.SD, function(x) {
+  x[x %in% c("NULL", "null")] <- NA  # Convert "NULL" or "null" to NA
+  as.numeric(x)  # Convert the column to numeric
+}), .SDcols = cols_to_convert]
+
+# Remove columns with more than 30% missing values
+na_proportion <- colMeans(is.na(daily_data))
+cols_to_keep <- names(na_proportion[na_proportion <= 0.3])
+daily_data <- daily_data[, ..cols_to_keep]
+
+# Create lookup vectors for start_date and end_date
+start_dates <- survey_data$start_date[match(daily_data$PatientID, survey_data$PatientID)]
+end_dates <- survey_data$end_date[match(daily_data$PatientID, survey_data$PatientID)]
+
+# Filter daily_data using vectorized lookup without joins
+daily_data <- daily_data[
+  !is.na(start_dates) & !is.na(end_dates) &  # Ensure the patient exists in survey_data
+  Date >= start_dates & Date <= end_dates
+]
+
+# Group by PatientID and Date, then compute mean (fast aggregation)
+daily_data <- daily_data[, lapply(.SD, mean, na.rm = TRUE), by = .(PatientID, Date)]
+
+# Order by PatientID and Date
+setorder(daily_data, PatientID, Date)
+```
+
+
+
+# impute the missing data for daily
+```{r}
+# Step 1: Make a copy of your data.table
+dt <- copy(daily_data)
+
+# Step 2: Exclude PatientID and Date from the imputation
+cols_to_impute <- setdiff(names(dt), c("PatientID", "Date"))
+impute_data <- dt[, ..cols_to_impute]
+
+# Step 3: Remove constant and collinear columns
+cols_to_remove <- c(
+  # Specified Heart variables to remove
+  "HeartRateZoneOutOfRangeMin",
+  "HeartRateZonePeakMax",
+  "HeartRateZoneFatBurnMin",
+  "HeartRateZoneCardioMin",
+  "HeartRateZonePeakMin",
+  "TrackerFloors",
+  
+  # Remove non-tracker versions when a Tracker version exists
+  "ActivityCalories",
+  "Calories",
+  "Distance",
+  "MinutesFairlyActive",
+  "MinutesLightlyActive",
+  "MinutesSedentary",
+  "MinutesVeryActive",
+  "Steps"
+)
+
+impute_data <- impute_data[, !cols_to_remove, with = FALSE]
+```
+
+# Check for MCAR
+```{r}
+# Set a seed for reproducibility
+set.seed(123)
+
+# Take a random sample of (say) 5000 rows — adjust size as needed
+impute_data[sample(nrow(impute_data), size = 10000), ] %>% 
+  mcar_test(.)
+
+# p_values < 0.05 # The data is MAR
+```
+
+
+# Assess accurarcy of MICE on complete set
+```{r}
+impute_rmse_evaluation <- function(data) {
+  # Convert to a data.frame if needed (e.g., if it's a data.table)
+  if (inherits(data, "data.table")) {
+    data <- as.data.frame(data)
+  }
+
+  # 1. Identify columns with missing data in the original dataset
+  missing_cols <- names(data)[sapply(data, function(x) any(is.na(x)))]
+  if (length(missing_cols) == 0) {
+    stop("No columns with missing data detected in the dataset.")
+  }
+  
+  # 2. Calculate percent missing for each of these columns (from the original data)
+  percent_missing <- sapply(data[missing_cols], function(x) mean(is.na(x)))
+  
+  # 3. Isolate complete records (rows with no missing values)
+  complete_data <- data[complete.cases(data), ]
+  n_complete <- nrow(complete_data)
+  
+  # 4. For each missing column, calculate the number of entries to knock out
+  knockout_numbers <- round(percent_missing * n_complete)
+  
+  # Make a copy of complete_data for inducing missingness
+  test_data <- complete_data
+  
+  # Create a list to store the indices and true values for each column
+  true_values_list <- list()
+  set.seed(123)  # For reproducibility
+  
+  for (col in missing_cols) {
+    n_knock <- knockout_numbers[col]
+    if (n_knock > 0) {
+      indices <- sample(seq_len(n_complete), size = n_knock, replace = FALSE)
+      true_values_list[[col]] <- list(
+        indices = indices,
+        true_values = complete_data[indices, col]
+      )
+      # Induce missingness by setting the chosen entries to NA
+      test_data[indices, col] <- NA
+    } else {
+      true_values_list[[col]] <- list(indices = integer(0), true_values = numeric(0))
+    }
+  }
+  
+  # 5. Impute the artificially induced missing data using MICE (single imputation)
+  imputed <- mice(test_data, m = 1, printFlag = FALSE)
+  completed_data <- complete(imputed, 1)
+  
+  # <-- Insert abrupt return here for debugging: Return logged events only.
+  
+  # 6. For each column, calculate RMSE and normalized RMSE (normalized by standard deviation)
+  rmse_results <- lapply(missing_cols, function(col) {
+    info <- true_values_list[[col]]
+    if (length(info$indices) > 0) {
+      imputed_vals <- completed_data[info$indices, col]
+      true_vals <- as.numeric(info$true_values)
+      rmse <- sqrt(mean((imputed_vals - true_vals)^2))
+      
+      # Normalize RMSE by the standard deviation of the variable in the complete data
+      sd_val <- sd(complete_data[[col]], na.rm = TRUE)
+      normalized_rmse <- rmse / sd_val
+      
+      data.frame(variable = col,
+                 percent_missing = percent_missing[col],
+                 n_missing = knockout_numbers[col],
+                 rmse = rmse,
+                 normalized_rmse = normalized_rmse,
+                 stringsAsFactors = FALSE)
+    } else {
+      data.frame(variable = col,
+                 percent_missing = percent_missing[col],
+                 n_missing = knockout_numbers[col],
+                 rmse = NA,
+                 normalized_rmse = NA,
+                 stringsAsFactors = FALSE)
+    }
+  })
+  
+  # Combine the individual results into a single data frame
+  details_df <- do.call(rbind, rmse_results)
+  
+  # 7. Calculate the overall mean and standard deviation of the normalized RMSE
+  mean_norm_rmse <- mean(details_df$normalized_rmse, na.rm = TRUE)
+  sd_norm_rmse <- sd(details_df$normalized_rmse, na.rm = TRUE)
+  
+  summary_df <- data.frame(mean_normalized_rmse = mean_norm_rmse,
+                           sd_normalized_rmse = sd_norm_rmse,
+                           stringsAsFactors = FALSE)
+  
+  # Return a list with the detailed results and summary metrics
+  return(list(details = details_df, summary = summary_df))
+}
+
+# Example usage (this will return only the logged events for debugging):
+# result <- impute_rmse_evaluation(impute_data)
+# print(result)
+
+
+
+
+
+# $summary
+#   mean_normalized_rmse sd_normalized_rmse
+# 1            0.5729262             0.3746
+
+```
+
+
+# Impute data
+```{r}
+# Step 4: Run `mice` with `pmm`, multiple imputations (`m = 5`) for averaging
+imp <- mice(impute_data, method = "pmm", m = 5, seed = 123, print = F)
+
+# Step 5: Extract all imputed datasets and compute the mean across imputations
+imputed_list <- lapply(1:5, function(i) complete(imp, i))  # Extract all imputed datasets
+imputed_data_set <- Reduce("+", imputed_list) / 5  # Compute element-wise mean
+
+# Step 6: Reattach PatientID and Date
+daily_data_imputed <- cbind(dt[, .(PatientID, Date)], imputed_data_set)
+
+# Step 7: Print number of missing values per column (should be all 0)
+colSums(is.na(imputed_data_set))
+```
+
+
+# aggregate non-imputed and get skipped
+```{r}
+# Group by PatientID and Date, then compute mean (fast aggregation)
+daily_data <- daily_data[, lapply(.SD, mean, na.rm = TRUE), by = .(PatientID, Date)]
+
+# Add 'skipped' column: if any rows are NA, 1 otheriswe 0.
+data_cols <- setdiff(names(daily_data), c("PatientID", "Date"))
+daily_data[, skipped := fifelse(rowSums(is.na(.SD)) > 0, 1, 0), .SDcols = data_cols]
+```
+
+# aggregate imputed and append skipped by PatientID and Date
+```{r}
+# Define columns to aggregate (exclude PatientID and Date)
+data_cols <- setdiff(names(daily_data_imputed), c("PatientID", "Date"))
+
+
+# Perform a left join to bring in the 'skipped' column from daily_data
+daily_data_imputed_agg <- merge(daily_data_imputed, 
+                                daily_data[, .(PatientID, Date, skipped)], 
+                                by = c("PatientID", "Date"), 
+                                all.x = TRUE)
+
+```
+
+# Save daily_data and imputed data
+```{r}
+write_tsv(daily_data, "../data/intermediate/daily_data.tsv")
+write_tsv(daily_data_imputed_agg, "../data/intermediate/daily_data_imputed.tsv")
+```
+

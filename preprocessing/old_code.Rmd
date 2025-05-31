@@ -1,0 +1,59 @@
+```{r}
+# Step 1: Compute days_last_record without modifying filtered_data
+filtered_data_with_days <- filtered_data %>%
+  na.omit() %>% 
+  arrange(PatientID, Date) %>%  # Ensure chronological order per subject
+  group_by(PatientID) %>%
+  mutate(days_last_record = as.numeric(Date - lag(Date))) %>%  # Compute difference in days
+  mutate(days_last_record = replace_na(days_last_record, 0)) %>%  # Set first record to 0
+  ungroup()
+
+filtered_data_with_days %>% select(PatientID, Date, days_last_record)
+
+
+# Step 2: Compute max days_last_record per subject for ECDF
+subject_max_days <- filtered_data_with_days %>%
+  group_by(PatientID) %>%
+  summarize(max_days_last_record = max(days_last_record))  # Get max days_last_record per subject
+
+# Step 3: Plot ECDF of max days_last_record per subject
+ggplot(subject_max_days, aes(x = max_days_last_record)) +
+  stat_ecdf(geom = "step", color = "blue", size = 1) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +  # Ensure raw x-axis values
+  theme_minimal() +
+  labs(
+    title = "ECDF of Maximum Days Between Records Per Subject",
+    x = "Maximum Days Between Records",
+    y = "Proportion of Subjects (≥ X Days)"
+  )
+
+
+
+```
+```{r}
+# merged_data %>% 
+#   select(PatientID) %>% 
+#   group_by(PatientID) %>% 
+#   summarize(counts = n()) %>% 
+#   arrange(counts)
+```
+
+
+
+
+# Remove Subjects that have >= 4 day gap
+```{r}
+# Step 1: Identify subjects with a max days_last_record of 4 or greater
+subjects_to_remove <- subject_max_days %>%
+  filter(max_days_last_record >= 4) %>%
+  pull(PatientID)  # Extract list of PatientIDs to remove
+
+# Step 2: Filter out these subjects from filtered_data_with_days
+filtered_data_cleaned <- filtered_data_with_days %>%
+  filter(!PatientID %in% subjects_to_remove)
+
+# Step 3: Check how many subjects were removed
+cat("Subjects removed:", length(subjects_to_remove), "\n")
+cat("Remaining subjects:", length(unique(filtered_data_cleaned$PatientID)), "\n")
+
+```

@@ -1,0 +1,318 @@
+```{r}
+library(tidyverse)        # For Generic data wrangling
+library(data.table)       # For efficient data wrangling
+library(lubridate)        # For working with date times
+library(naniar)           # View missing patterns
+
+setwd("/home/jeffrw/BIOSTAT629/main_project/preprocessing")
+```
+
+
+
+# Load preprocessed datasets
+```{r}
+# Load datasets from TSV files
+survey_data <- read_tsv("../data/intermediate/survey_data.tsv", show_col_types = F)
+daily_data <- read_tsv("../data/intermediate/daily_data.tsv", show_col_types = F)
+daily_data_imputed <- read_tsv("../data/intermediate/daily_data_imputed.tsv", show_col_types = F)
+sleep_data <- read_tsv("../data/intermediate/sleep_data.tsv", show_col_types = F)
+sleep_data_imputed <- read_tsv("../data/intermediate/imputed_sleep_data.tsv", show_col_types = F)
+```
+
+# Find common PatientIDs across all datasets
+```{r}
+common_patient_ids <- Reduce(intersect, list(
+  survey_data$PatientID, 
+  daily_data$PatientID, 
+  daily_data_imputed$PatientID, 
+  sleep_data$PatientID, 
+  sleep_data_imputed$PatientID
+))
+
+# Filter all datasets to keep only common PatientIDs
+survey_data <- survey_data %>% filter(PatientID %in% common_patient_ids)
+daily_data <- daily_data %>% filter(PatientID %in% common_patient_ids)
+daily_data_imputed <- daily_data_imputed %>% filter(PatientID %in% common_patient_ids)
+sleep_data <- sleep_data %>% filter(PatientID %in% common_patient_ids)
+sleep_data_imputed <- sleep_data_imputed %>% filter(PatientID %in% common_patient_ids)
+
+
+common_patient_ids %>% length()
+````
+
+# Filter Daily & Sleep Data Based on Survey Start & End Dates
+```{r}
+# Function to filter data based on survey start and end dates
+filter_dates_within_survey <- function(data, survey_data) {
+  data_filtered <- data %>%
+    inner_join(survey_data %>% select(PatientID, start_date, end_date), by = "PatientID") %>%
+    filter(Date >= start_date & Date <= end_date) %>%
+    select(-start_date, -end_date)  # Remove extra columns after filtering
+  
+  return(data_filtered)
+}
+
+# Apply function to filter daily and sleep datasets
+daily_data <- filter_dates_within_survey(daily_data, survey_data)
+daily_data_imputed <- filter_dates_within_survey(daily_data_imputed, survey_data)
+sleep_data <- filter_dates_within_survey(sleep_data, survey_data)
+sleep_data_imputed <- filter_dates_within_survey(sleep_data_imputed, survey_data)
+```
+
+# Helper functions
+```{r}
+# Function to compute and plot CDF using ecdf()
+plot_cdf <- function(data, dataset_name) {
+  date_counts <- data %>%
+    group_by(PatientID) %>%
+    summarize(num_dates = n()) 
+  
+  # Compute the empirical CDF
+  ecdf_func <- ecdf(date_counts$num_dates)
+  
+  # Create CDF plot (1 - ECDF for "at least" interpretation)
+  ggplot(data.frame(x = unique(date_counts$num_dates)), aes(x = x)) +
+    stat_function(fun = function(x) 1 - ecdf_func(x), geom = "line", color = "blue", size = 1) +
+    theme_minimal() +
+    labs(
+      title = paste("Cumulative CDF of Recorded Dates in", dataset_name),
+      x = "Number of Recorded Dates",
+      y = "Proportion of Subjects (≥ X Dates)"
+    )
+}
+
+# Function to check for non-consecutive dates
+plot_non_consecutive_histogram <- function(data, dataset_name) {
+  data %>%
+    arrange(PatientID, Date) %>%
+    group_by(PatientID) %>%
+    summarize(non_consecutive = sum(diff(as.Date(Date)) > 1)) %>%
+    ggplot(aes(x = non_consecutive)) +
+    geom_histogram(binwidth = 1, fill = "blue", alpha = 0.7) +
+    theme_minimal() +
+    labs(
+      title = paste("Histogram of Non-Consecutive Dates in", dataset_name),
+      x = "Number of Skipped Days",
+      y = "Number of Subjects"
+    )
+}
+
+
+daily_data_imputed
+```
+
+
+```{r}
+plot_cdf(daily_data, "Daily Data")
+plot_cdf(daily_data_imputed, "Daily Imputed Data")
+plot_cdf(sleep_data, "Sleep Data")
+plot_cdf(sleep_data_imputed, "Sleep Imputed Data")
+
+```
+```{r}
+plot_non_consecutive_histogram(daily_data, "Daily Data")
+plot_non_consecutive_histogram(daily_data_imputed, "Daily Imputed Data")
+plot_non_consecutive_histogram(sleep_data, "Sleep Data")
+plot_non_consecutive_histogram(sleep_data_imputed, "Sleep Imputed Data")
+
+```
+
+```{r}
+# Perform an outer join on PatientID and Date
+merged_data <- full_join(daily_data_imputed, sleep_data_imputed, by = c("PatientID", "Date"))
+
+# Sort by PatientID and Date
+merged_data <- merged_data %>% arrange(PatientID, Date)
+
+# Perform a left join to bring in survey data
+merged_data <- left_join(merged_data, survey_data, by = "PatientID")
+
+
+```
+
+# Only select subjects with at least 21 days worth of recrods
+```{r}
+# Function to filter patients with at least 21 entries
+filter_patients_with_min_entries <- function(data, min_entries = 21) {
+  data %>%
+    group_by(PatientID) %>%
+    filter(n() >= min_entries) %>%
+    ungroup()  # Ensure the result is ungrouped
+}
+
+# Apply the function to filter the dataset
+filtered_data <- filter_patients_with_min_entries(merged_data)
+
+```
+
+# INFO EXTRACTION, REMOVE LATTER
+```{r}
+merged_data %>%
+  group_by(PatientID) %>%
+  summarize(totals = n()) %>%
+  pull(totals) %>%
+  table() %>%
+  prop.table() %>%
+  cumsum()
+
+```
+```{r}
+# # Calculate date differences per subject
+# date_diffs <- merged_data %>%
+#   arrange(PatientID, Date) %>%
+#   group_by(PatientID) %>%
+#   mutate(date_diff = as.numeric(Date - lag(Date))) %>%
+#   filter(!is.na(date_diff))  # Remove first entry per patient since it has no diff
+# 
+# overall_avg <- mean(date_diffs$date_diff)
+# overall_sd <- sd(date_diffs$date_diff)
+# 
+# cat("Overall average date difference:", overall_avg, "\n")
+# cat("Overall standard deviation:", overall_sd, "\n")
+
+```
+
+
+
+# Check number of samples
+```{r}
+filtered_data %>% pull(PatientID) %>% unique() %>% length()
+```
+
+# Function to view missing rows that are not from sleep data
+```{r}
+missing_data_rows <- function(df, sleep_data) {
+  # Define the excluded columns dynamically from sleep_data
+  exclude_columns <- sleep_data %>% colnames()
+  
+  # Select columns that are NOT in the exclude list
+  relevant_data <- df[, !(colnames(df) %in% exclude_columns)]
+  
+  # Identify rows where all missing values are ONLY in the excluded columns
+  missing_in_excluded_only <- apply(df, 1, function(row) {
+    all(is.na(row[colnames(df) %in% exclude_columns])) && 
+    all(!is.na(row[!(colnames(df) %in% exclude_columns)]))
+  })
+  
+  # Return the matching rows
+  return(df[missing_in_excluded_only, ])
+}
+
+# Only missing data in sleep_data
+missing_data_rows(filtered_data, sleep_data)
+```
+
+# fill NA with 0, and add skipped indicator
+```{r}
+update_skipped_and_fill_na <- function(df) {
+  df <- df %>%
+    mutate(skipped = ifelse(rowSums(is.na(.)) > 0, 1, 0)) %>% # Set skipped to 1 if any NA in row
+    mutate(across(everything(), ~ replace_na(., 0))) # Replace all NAs with 0
+  
+  return(df)
+}
+
+
+filtered_data_filled <- update_skipped_and_fill_na(filtered_data)
+```
+
+# get timepoints
+```{r}
+timepoints <- function(df) {
+  df %>%
+    group_by(PatientID) %>%
+    arrange(Date, .by_group = TRUE) %>%  # Ensure data is sorted by Date within each PatientID
+    mutate(timepoints = as.integer(difftime(Date, min(Date), units = "days"))) %>%
+    ungroup() %>% 
+    mutate(timepoints = timepoints + 1)# Remove grouping for final output
+}
+
+# Apply the function to filtered_data_filled
+filtered_data_cleaned <- timepoints(filtered_data_filled)
+
+```
+#################### OLD CODE HERE ####################
+
+
+# Ensure non-imputed data and survey data have same date/id as the filtered set
+```{r}
+# Compute common PatientIDs across all datasets
+common_patient_ids <- Reduce(intersect, list(
+  unique(filtered_data_cleaned$PatientID),
+  unique(daily_data$PatientID),
+  unique(sleep_data$PatientID),
+  unique(survey_data$PatientID)
+))
+
+# Extract final PatientIDs and Dates from filtered_data_cleaned for the common patients
+final_patient_dates <- filtered_data_cleaned %>%
+  filter(PatientID %in% common_patient_ids) %>%
+  select(PatientID, Date) %>%
+  distinct()
+
+# Filter daily_data and sleep_data using an inner join on PatientID and Date
+daily_data_cleaned <- daily_data %>%
+  inner_join(final_patient_dates, by = c("PatientID", "Date"))
+
+sleep_data_cleaned <- sleep_data %>%
+  inner_join(final_patient_dates, by = c("PatientID", "Date"))
+
+# Filter survey_data to keep only the common PatientIDs
+survey_data_cleaned <- survey_data %>%
+  filter(PatientID %in% common_patient_ids)
+
+# Filter filtered_data_cleaned to keep only the common PatientIDs
+filtered_data_cleaned <- filtered_data_cleaned %>%
+  filter(PatientID %in% common_patient_ids)
+
+
+
+# Define the columns to remove
+cols_to_remove <- c(
+  # Specified Heart variables to remove
+  "HeartRateZoneOutOfRangeMin",
+  "HeartRateZonePeakMax",
+  "HeartRateZoneFatBurnMin",
+  "HeartRateZoneCardioMin",
+  "HeartRateZonePeakMin",
+  
+  # Remove non-tracker versions when a Tracker version exists
+  "ActivityCalories",
+  "Calories",
+  "Distance",
+  "MinutesFairlyActive",
+  "MinutesLightlyActive",
+  "MinutesSedentary",
+  "MinutesVeryActive",
+  "Steps"
+)
+
+daily_data_cleaned %>% colnames()
+
+# Need to remove above columns from daily, since we removed them based on imputation before(see fibit_daily_preprocessing)
+daily_data_cleaned <- daily_data_cleaned %>% select(-all_of(cols_to_remove))
+
+```
+
+# Filter out unneeded columns for modeling
+```{r}
+filtered_data_cleaned %>% colnames()
+```
+```{r}
+filtered_data_cleaned <- filtered_data_cleaned %>% select(-c(Date, end_date, start_date, Weeks_Difference, Baseline_Date))
+```
+
+
+
+# Save cleaned files
+```{r}
+# Save all cleaned datasets
+write_tsv(daily_data_cleaned, "../data/cleaned/daily_data_cleaned.tsv")
+write_tsv(sleep_data_cleaned, "../data/cleaned/sleep_data_cleaned.tsv")
+write_tsv(survey_data_cleaned, "../data/cleaned/survey_data_cleaned.tsv")
+write_tsv(filtered_data_cleaned, "../data/cleaned/combined_data_cleaned.tsv")  # Save final combined dataset
+
+
+```
+
+

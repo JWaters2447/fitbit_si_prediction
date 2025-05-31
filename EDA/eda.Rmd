@@ -1,0 +1,600 @@
+```{r, message=FALSE, warning=False}
+library(tidyverse) # data wrangling and plotting
+library(lubridate) # working with dates
+library(readr)     # read in tsv files
+library(gtsummary) # create tables
+library(ComplexHeatmap)  # For viewing tables
+library(circlize)       # For generating color scheme
+library(grid)
+```
+
+
+```{r, message=FALSE, warning=False}
+# Read in the cleaned datasets
+daily_data_cleaned <- read_tsv("../data/cleaned/daily_data_cleaned.tsv", show_col_types = F)
+sleep_data_cleaned <- read_tsv("../data/cleaned/sleep_data_cleaned.tsv", show_col_types = F)
+survey_data_cleaned <- read_tsv("../data/cleaned/survey_data_cleaned.tsv", show_col_types = F)
+filtered_data_cleaned <- read_tsv("../data/cleaned/combined_data_cleaned.tsv", show_col_types = F)  # Final combined dataset
+
+
+# survey_data_cleaned %>% select(age) %>% 
+#   summarize(mean = mean(age), sd=sd(age)) %>% 
+#   round(2)
+```
+
+# Table of survey data
+```{r}
+create_and_save_survey_table <- function(data, 
+                                         tex_file_path = "../figures/table1/survey_data.tex",
+                                         html_file_path = "../figures/table1/survey_data.html") {
+  data <- data %>% 
+    select(-SI_max) %>% 
+    mutate(SI_mean = round(SI_mean))
+  
+  capitalize_first <- function(x) {
+    paste0(toupper(substr(x, 1, 1)), substr(x, 2, nchar(x)))
+  }
+  
+  survey_table_data <- data %>%
+    select(-PatientID, -Baseline_Date, -end_date, -Weeks_Difference, -start_date) %>%
+    rename_with(.fn = capitalize_first)
+  
+  total_n <- nrow(survey_table_data)
+  
+  survey_table <- tbl_summary(
+    survey_table_data,
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    by = "SI_mean",
+    missing = "no"
+  ) %>%
+    add_overall(last = TRUE) %>%
+    add_p(test = all_categorical() ~ "chisq.test") %>%
+    modify_header(
+      stat_0 ~ paste0("**Total (N = ", total_n, ")**"),
+      p.value ~ "**p-value**"
+    )
+  
+  # print(survey_table)
+  # Save as LaTeX:
+  latex_table <- as_kable(survey_table, format = "latex")
+  cat(latex_table, file = tex_file_path)
+  # Save as HTML:
+  gt_table <- as_gt(survey_table)
+  gt::gtsave(gt_table, html_file_path)
+}
+
+create_and_save_survey_table(survey_data_cleaned)
+```
+# Create Heatmap of survey data for table 1
+```{r, fig.width=8, fig.height=9.5}
+create_survey_heatmap <- function(data) {
+  # Preprocess data: remove SI_max (if present) and round SI_mean
+  if("SI_max" %in% names(data)) {
+    data <- data %>% select(-SI_max)
+  }
+  data <- data %>% mutate(SI_mean = round(SI_mean))
+  
+  # Specify the desired order for the grouping variables
+  desired_order <- c("Race", "isHispanic", "sex", "gender", 
+                     "education", "employment", "Relationship_Status", "sexuality")
+  cat_vars <- intersect(desired_order, names(data))
+  
+  # Get sorted SI_mean levels as characters (for columns)
+  si_levels <- sort(unique(data$SI_mean))
+  si_levels_chr <- as.character(si_levels)
+  
+  # Prepare list to store percentage matrices and vector for row splits
+  heatmap_list <- list()
+  row_split <- c()
+  
+  for (var in cat_vars) {
+    var_levels <- sort(unique(data[[var]]))
+    tab <- table(factor(data[[var]], levels = var_levels), 
+                 factor(data$SI_mean, levels = si_levels))
+    overall_pct <- rowSums(tab) / sum(tab)
+    # Order rows in descending order based on overall percentages
+    ord <- order(overall_pct, decreasing = TRUE)
+    tab_ordered <- tab[ord, , drop = FALSE]
+    overall_pct_ordered <- rowSums(tab_ordered) / sum(tab_ordered)
+    pct_tab <- sweep(tab_ordered, 2, colSums(tab_ordered), FUN = "/")
+    # Combine the SI_mean columns with an extra "Total" column
+    mat <- cbind(as.matrix(pct_tab), Total = overall_pct_ordered)
+    heatmap_list[[var]] <- mat
+    group_label <- paste0(toupper(substr(var, 1, 1)), substr(var, 2, nchar(var)))
+    row_split <- c(row_split, rep(group_label, nrow(mat)))
+  }
+  
+  # Combine matrices by row-binding them
+  heatmap_matrix <- do.call(rbind, heatmap_list)
+  colnames(heatmap_matrix) <- c(si_levels_chr, "Total")
+  
+  # Compute sample counts for each SI_mean group and overall (Total)
+  si_counts <- sapply(si_levels, function(x) sum(data$SI_mean == x))
+  total_count <- nrow(data)
+  sample_counts <- c(si_counts, total_count)
+  sample_counts_text <- sprintf("N = %d", sample_counts)
+  
+  # For the top annotation, we use the heatmap’s column names as SI_mean values.
+  # For the custom legend, we want a fixed order: Total, 5, 4, 3, 2, 1.
+  si_groups <- c(si_levels_chr, "Total")
+  si_legend_groups <- c("Total", "5", "4", "3", "2", "1")
+  si_legend_colors <- c("gray", "red", "orange", "yellow", "green", "blue")
+  names(si_legend_colors) <- si_legend_groups
+  
+  # Create top annotation (sample counts and a color bar for SI_mean)
+  top_anno <- HeatmapAnnotation(
+    SampleCount = anno_text(sample_counts_text, 
+                            gp = gpar(fontface = "bold", fontsize = 14),
+                            rot = 45, just = "left"),
+    SI_mean = anno_simple(colnames(heatmap_matrix), 
+                           col = setNames(c("blue", "green", "yellow", "orange", "red", "gray"), si_groups),
+                           border = TRUE),
+    annotation_height = unit(c(10, 7), "mm"),
+    gap = unit(-9, "mm"),
+    show_annotation_name = TRUE,
+    annotation_name_gp = gpar(fontsize = 15, fontface="bold")
+  )
+  
+  # -------------------- Add Boxplot Annotation for Age --------------------
+  # Create a list of age values grouped by SI_mean levels plus overall ("Total")
+  age_by_si <- lapply(si_levels, function(x) data$age[data$SI_mean == x])
+  names(age_by_si) <- si_levels_chr
+  # Add overall "Total" (all ages)
+  age_by_si[["Total"]] <- data$age
+  
+  # Control the size of the boxplot annotation here:
+  boxplot_annotation_height <- unit(20, "mm")  # <-- Adjust this value to change the boxplot's height
+  
+  # Create bottom annotation with boxplot of age by SI_mean.
+  # The list "age_by_si" now has one element per column in heatmap_matrix.
+  bottom_anno <- HeatmapAnnotation(
+    Age = anno_boxplot(age_by_si,
+                              gp = gpar(fill = "lightblue", col = "black"),
+                              box_width = 0.8
+                              ),
+    annotation_height = boxplot_annotation_height
+  )
+  # --------------------------------------------------------------------------
+  
+  # Define cell color mapping for percentages using a coolwarm palette.
+  cell_colors <- colorRamp2(c(0, 0.5, 1), c("blue", "white", "red"))
+  
+  # Create the heatmap with the bottom annotation added.
+  ht <- Heatmap(heatmap_matrix,
+                name = "Proportion",
+                col = cell_colors,
+                top_annotation = top_anno,
+                bottom_annotation = bottom_anno,  # Boxplot of age by SI_mean at the bottom
+                cluster_rows = FALSE,
+                cluster_columns = FALSE,
+                row_split = row_split,
+                show_column_names = FALSE,
+                column_title = "Heatmap of Survey Data\n\n\n",
+                column_title_gp = gpar(fontsize = 18, fontface = "bold"),
+                row_title_rot = 0,
+                row_title_gp = gpar(fontface = "bold"),
+                row_gap = unit(2, "mm"),
+                row_names_gp = gpar(fontsize = 13.5),
+                show_heatmap_legend = F,
+                border_gp = gpar(col = "black"),
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  grid.rect(
+                    x = x, y = y, width = width, height = height, 
+                    gp = gpar(col = "black", fill = NA, lwd = 0.5)
+                  )
+                }
+  )
+  
+  # Create a custom SI_Mean legend.
+  si_mean_legend <- Legend(
+    at = si_legend_groups,
+    labels = rev(si_legend_groups),
+    legend_gp = gpar(fill = rev(si_legend_colors), fontsize = 12),
+    title = "SI_Mean",
+    title_gp = gpar(fontface = "bold", fontsize = 14),
+    grid_height = unit(5.5, "mm"),
+    grid_width = unit(5.5, "mm"),
+    direction = "vertical",
+    gap = unit(2, "mm"),
+    labels_gp = gpar(fontsize = 14)
+  )
+  
+  # Create a separate Percentage legend.
+  percentage_legend <- Legend(
+    at = c(0, 0.25, 0.5, 0.75, 1),
+    labels = c("0", "0.25", "0.5", "0.75", "1"),
+    col_fun = colorRamp2(c(0, 0.5, 1), c("blue", "white", "red")),
+    title = "Proportion",
+    legend_height = unit(30, "mm"),
+    legend_width =  unit(40, "mm"),
+    title_gp = gpar(fontface = "bold", fontsize = 14),
+    labels_gp = gpar(fontsize = 14),
+    direction = "vertical"
+  )
+  
+  # Combine the two legends.
+  combined_legends <- packLegend(percentage_legend, si_mean_legend, direction = "horizontal")
+
+  
+  
+  # # Save heatmap as PNG
+  png("../figures/table1/table1_heatmap.png", width = 2500, height = 2500, res = 300)
+  # 
+  # # Draw the heatmap with legends on the right
+  draw(ht, heatmap_legend_side = "right", annotation_legend_list = combined_legends)
+  # 
+  # # Close the file
+  dev.off()
+}
+
+# Example call (assuming survey_data_cleaned exists in the environment)
+create_survey_heatmap(survey_data_cleaned)
+
+```
+
+
+#Table of Time Series Data
+```{r}
+
+sleep_data_cleaned %>% colnames()
+filtered_data_cleaned %>% colnames()
+daily_data_cleaned %>% colnames()
+```
+
+
+# Aggregate time-series data(Don't need to run)
+
+```{r}
+aggregate_all_data <- function(sleep_df, daily_df, filtered_df) {
+  library(dplyr)
+  
+  ## 1. Aggregate sleep data:
+  # For sleep: aggregate all columns except Date by mean (na.rm = TRUE)
+  aggregated_sleep <- sleep_df %>%
+    group_by(PatientID) %>%
+    summarise(across(-Date, ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+  
+  ## 2. Aggregate daily data:
+  # For daily: aggregate all columns except Date and skipped by mean (na.rm = TRUE)
+  aggregated_daily <- daily_df %>%
+    group_by(PatientID) %>%
+    summarise(across(-c(Date, skipped), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+  
+  ## 3. Aggregate filtered data:
+  # Define columns that should NOT be aggregated by mean but instead take the first value.
+  exception_cols <- c("Date", "Baseline_Date", "end_date", "Race", "isHispanic", 
+                        "Relationship_Status", "education", "employment", "sex", 
+                        "gender", "sexuality", "SI_max", "SI_mean", "Weeks_Difference", 
+                        "start_date, age")
+  
+  # Identify numeric columns in filtered_df.
+  numeric_cols <- names(filtered_df)[sapply(filtered_df, is.numeric)]
+  # For numeric columns, we want to use mean except for timepoints.
+  mean_cols <- setdiff(numeric_cols, c("timepoints", exception_cols))
+  
+  aggregated_filtered <- filtered_df %>%
+    group_by(PatientID) %>%
+    summarise(
+      # Aggregate numeric columns (that are not exceptions) using mean.
+      across(all_of(mean_cols), ~ mean(.x, na.rm = TRUE)),
+      # Aggregate timepoints by sum.
+      timepoints = sum(timepoints, na.rm = TRUE),
+      # For exception columns, take the first value (assumes these are non-numeric or invariant per patient)
+      across(all_of(exception_cols), ~ first(.x)),
+      .groups = "drop"
+    )
+  
+  # Return the aggregated data as a list
+  list(
+    sleep = aggregated_sleep,
+    daily = aggregated_daily,
+    filtered = aggregated_filtered
+  )
+}
+
+# Example usage:
+# result <- aggregate_all_data(sleep_data_cleaned, daily_data_cleaned, filtered_data_cleaned)
+```
+
+# (Don't need to run)
+
+```{r}
+generate_combined_table <- function(aggregated_sleep, aggregated_daily, aggregated_filtered) {
+
+    # 1. Join aggregated_daily and aggregated_sleep on PatientID.
+  joined_daily_sleep <- aggregated_daily %>%
+    inner_join(aggregated_sleep, by = "PatientID", suffix = c("_daily", "_sleep"))
+  
+  # 2. Extract the skipped column from aggregated_filtered and join it.
+  skipped_df <- aggregated_filtered %>% 
+    select(PatientID, skipped)
+  
+  joined_daily_sleep <- joined_daily_sleep %>%
+    left_join(skipped_df, by = "PatientID")
+  
+  return(joined_daily_sleep)
+  
+  # 3. Add imputed_set flag.
+  joined_daily_sleep <- joined_daily_sleep %>%
+    mutate(imputed_set = 0)
+  
+  aggregated_filtered <- aggregated_filtered %>%
+    mutate(imputed_set = 1)
+  
+  # 4. Combine the joined daily+sleep data with the aggregated filtered data.
+  combined_df <- bind_rows(joined_daily_sleep, aggregated_filtered)
+  
+  # 5. Generate a gtsummary table stratified by imputed_set.
+  summary_table <- tbl_summary(
+    combined_df,
+    by = imputed_set,  # stratify table by imputed_set (0 = daily+sleep, 1 = filtered)
+    missing = "no"
+  )
+  
+  return(summary_table)
+}
+
+
+# combined_table <- generate_combined_table(result$sleep, result$daily, result$filtered)
+```
+
+
+######## DELAY ########
+# Generate time-series table(Don't need to run)
+```{r}
+combine_and_create_table <- function(aggregated_daily, aggregated_sleep, aggregated_filtered, output_file = "../figures/table1/combined_table.tex") {
+  
+  # 1. Join aggregated daily and sleep datasets by PatientID
+  joined_daily_sleep <- aggregated_daily %>%
+    inner_join(aggregated_sleep, by = "PatientID")
+  
+  # 2. Append "skipped" from aggregated_filtered to joined_daily_sleep
+  skipped_df <- aggregated_filtered %>% select(PatientID, skipped)
+  joined_daily_sleep <- joined_daily_sleep %>%
+    left_join(skipped_df, by = "PatientID")
+  
+  # 3. Combine daily+sleep with aggregated filtered data and drop PatientID,
+  # and add an "imputed" flag
+  combined_df <- bind_rows(joined_daily_sleep, aggregated_filtered) %>% 
+    select(-PatientID) %>% 
+    mutate(imputed = rep(c("Not Imputed", "Imputed"), each = nrow(joined_daily_sleep)))
+  
+  # 4. Drop the specified columns from combined_df
+  columns_to_drop <- c("timepoints", "Date", "Baseline_Date", "end_date", "Race",
+                         "isHispanic", "Relationship_Status", "education", "employment",
+                         "sex", "gender", "sexuality", "SI_max", "SI_mean", 
+                         "Weeks_Difference", "start_date")
+  combined_df <- combined_df %>% select(-all_of(columns_to_drop))
+  
+  # 5. Create a gtsummary table stratified by imputed, displaying Mean (SD)
+  summary_table <- tbl_summary(
+    combined_df,
+    by = imputed,          # Stratify by the imputed flag
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})"  # Use mean (SD) instead of median (IQR)
+    ),
+    missing = "no"         # Do not display missing column
+  )
+
+  # 6. Convert the gtsummary table to LaTeX format and save it
+  latex_table <- as_kable(summary_table, format = "latex")
+  writeLines(latex_table, output_file)
+
+  return(summary_table)
+}
+
+# Example usage:
+# combine_and_create_table(result$daily, result$sleep, result$filtered)
+
+
+```
+
+
+# Generate Time Series Heatmaps
+```{r, fig.width=25, fig.height=10}
+
+generate_time_series_heatmap <- function(daily_data_cleaned, sleep_data_cleaned, survey_data_cleaned) {
+  ## 1. Aggregate daily data: compute mean per PatientID (drop "Date")
+  daily_agg_mean <- daily_data_cleaned %>%
+    select(-Date) %>%
+    group_by(PatientID) %>%
+    summarise_all(mean, na.rm = TRUE) %>%
+    as.data.frame()
+  rownames(daily_agg_mean) <- daily_agg_mean$PatientID
+  daily_agg_mean$PatientID <- NULL
+  
+  ## 2. Aggregate sleep data: compute mean per PatientID (drop "Date")
+  sleep_agg_mean <- sleep_data_cleaned %>%
+    select(-Date) %>%
+    group_by(PatientID) %>%
+    summarise_all(mean, na.rm = TRUE) %>%
+    as.data.frame()
+  rownames(sleep_agg_mean) <- sleep_agg_mean$PatientID
+  sleep_agg_mean$PatientID <- NULL
+  
+  ## 3. Prepare survey metadata using SI_mean only; round SI_mean and sort in ascending order (so SI_mean 1 to 5 left-to-right)
+  survey_meta_sorted <- survey_data_cleaned %>%
+    select(PatientID, SI_mean) %>%
+    mutate(SI_mean = round(SI_mean)) %>%
+    arrange(SI_mean) %>%
+    as.data.frame()
+  
+  ## 4. Order the aggregated data by the PatientID order in survey_meta_sorted
+  pid_order <- as.character(survey_meta_sorted$PatientID)
+  daily_ordered <- daily_agg_mean[pid_order, , drop = FALSE]
+  sleep_ordered <- sleep_agg_mean[pid_order, , drop = FALSE]
+  
+  ## 5. Apply min–max scaling to each feature (column)
+  scale_min_max <- function(x) {
+    rng <- range(x, na.rm = TRUE)
+    if (diff(rng) == 0) {
+      rep(0, length(x))
+    } else {
+      (x - rng[1]) / diff(rng)
+    }
+  }
+  daily_scaled <- as.data.frame(sapply(daily_ordered, scale_min_max))
+  rownames(daily_scaled) <- rownames(daily_ordered)
+  sleep_scaled <- as.data.frame(sapply(sleep_ordered, scale_min_max))
+  rownames(sleep_scaled) <- rownames(sleep_ordered)
+  
+  ## 6. Transpose data so that rows are features and columns are patients; replace any NA with 0
+  daily_matrix <- t(as.matrix(daily_scaled))
+  daily_matrix[is.na(daily_matrix)] <- 0
+  sleep_matrix <- t(as.matrix(sleep_scaled))
+  sleep_matrix[is.na(sleep_matrix)] <- 0
+  
+  # Ensure column names (patient IDs) are characters
+  colnames(daily_matrix) <- as.character(colnames(daily_matrix))
+  colnames(sleep_matrix) <- as.character(colnames(sleep_matrix))
+  
+  ## 7. Reorder columns: For each rounded SI_mean level (1 to 5), perform hierarchical clustering (via hclust) and then combine the orders.
+  reorder_columns <- function(mat, survey_meta) {
+    unique_levels <- sort(unique(survey_meta$SI_mean), decreasing = FALSE)
+    final_order <- c()
+    for (level in unique_levels) {
+      patients_in_group <- as.character(survey_meta %>% filter(SI_mean == level) %>% pull(PatientID))
+      # Ensure the patients exist in the matrix columns
+      patients_in_group <- patients_in_group[patients_in_group %in% colnames(mat)]
+      if (length(patients_in_group) > 0) {
+        submat <- mat[, patients_in_group, drop = FALSE]
+        if (ncol(submat) > 1) {
+          d <- dist(t(submat))
+          hc <- hclust(d, method = "ward.D2")
+          group_order <- patients_in_group[hc$order]
+        } else {
+          group_order <- patients_in_group
+        }
+        final_order <- c(final_order, group_order)
+      }
+    }
+    return(final_order)
+  }
+  
+  final_order_daily <- reorder_columns(daily_matrix, survey_meta_sorted)
+  final_order_sleep <- reorder_columns(sleep_matrix, survey_meta_sorted)
+  
+  # Reorder matrices using the final orders
+  daily_matrix <- daily_matrix[, final_order_daily, drop = FALSE]
+  sleep_matrix <- sleep_matrix[, final_order_sleep, drop = FALSE]
+  
+  ## 8. Create a column split factor based on the rounded SI_mean using the final order.
+  survey_meta_ordered_daily <- survey_meta_sorted[match(final_order_daily, survey_meta_sorted$PatientID), ]
+  col_split_daily <- factor(survey_meta_ordered_daily$SI_mean,
+                            levels = sort(unique(survey_meta_sorted$SI_mean), decreasing = FALSE))
+  
+  survey_meta_ordered_sleep <- survey_meta_sorted[match(final_order_sleep, survey_meta_sorted$PatientID), ]
+  col_split_sleep <- factor(survey_meta_ordered_sleep$SI_mean,
+                            levels = sort(unique(survey_meta_sorted$SI_mean), decreasing = FALSE))
+  
+  ## 9. Define a spectral color palette for SI_mean labels and prepare top annotation.
+  si_colors <- c("1" = "#0000FF",  # blue
+                 "2" = "#008000",  # green
+                 "3" = "#FFFF00",  # yellow
+                 "4" = "#FFA500",  # orange
+                 "5" = "#FF0000")  # red
+  
+  si_labels_daily <- as.character(survey_meta_ordered_daily$SI_mean)
+  si_labels_sleep <- as.character(survey_meta_ordered_sleep$SI_mean)
+  
+  top_anno_daily <- HeatmapAnnotation(
+    SI_mean = si_labels_daily,
+    col = list(SI_mean = si_colors),
+    border = TRUE,
+    show_legend = F,
+    annotation_name_gp = gpar(fontsize = 20, fontface = "bold"),
+    annotation_legend_param = list(
+      title_gp = gpar(fontsize = 28, fontface = "bold"),
+      labels_gp = gpar(fontsize = 20, fontface = "bold"),
+      grid_width = unit(1, "cm"),
+      grid_height = unit(1, "cm")
+    )
+  )
+  
+  
+  top_anno_sleep <- HeatmapAnnotation(
+    SI_mean = si_labels_sleep,
+    border = TRUE,
+    col = list(SI_mean = si_colors),
+    annotation_name_gp = gpar(fontsize = 25, fontface = "bold"),
+    annotation_legend_param = list(
+      title_gp = gpar(fontsize = 20, fontface = "bold"),
+      labels_gp = gpar(fontsize = 20, fontface = "bold"),
+      grid_width = unit(1, "cm"),
+      grid_height = unit(1, "cm")
+    )
+  )
+  
+  ## 10. Define titles for the two plots and a color function (coolwarm-like palette centered at 0.5)
+  titles <- c("Daily Fitbit (Mean)", "Sleep Fitbit (Mean)")
+  col_fun <- colorRamp2(c(0, 0.5, 1), c("blue", "white", "red"))
+  
+  ## 11. Create the heatmap for Daily data using our custom column order and split.
+  heatmap_daily <- Heatmap(
+    daily_matrix,
+    name = "Min-Max Scaled Value",
+    col = col_fun,
+    column_title = titles[1],
+    column_title_gp = gpar(fontsize = 40, fontface = "bold"),
+    row_names_gp = gpar(fontsize = 15, fontface = "bold"),
+    row_names_side = "left",
+    row_names_max_width = unit(10, "cm"),
+    top_annotation = top_anno_daily,
+    column_split = col_split_daily,
+    column_order = final_order_daily,
+    show_column_names = FALSE,
+    show_heatmap_legend = FALSE,  # hide the legend for the daily heatmap
+    column_gap = unit(0.5, "cm"),   # Increase gap between SI_mean groups
+    cluster_columns = FALSE,
+    cluster_rows = FALSE,
+    use_raster = TRUE
+  )
+  
+  ## 12. Create the heatmap for Sleep data using our custom column order and split.
+  heatmap_sleep <- Heatmap(
+    sleep_matrix,
+    name = "Min-Max Scaled Value",
+    col = col_fun,
+    column_title = titles[2],
+    column_title_gp = gpar(fontsize = 40, fontface = "bold"),
+    row_names_gp = gpar(fontsize = 20, fontface = "bold"),
+    row_names_side = "left",
+    row_names_max_width = unit(10, "cm"),
+    top_annotation = top_anno_sleep,
+    column_split = col_split_sleep,
+    column_order = final_order_sleep,
+    show_column_names = FALSE,
+    heatmap_legend_param = list(
+      title = "Min-Max Scaled Value",
+      title_gp = gpar(fontsize = 20, fontface = "bold"),
+      labels_gp = gpar(fontsize = 20, fontface = "bold"),
+      legend_height = unit(5, "cm"),
+      legend_width = unit(4, "cm"),
+      grid_width = unit(1, "cm"),
+      grid_height = unit(3, "cm"),
+      at = c(0, 0.25, 0.5, 0.75, 1),
+      labels = c("0", "0.25", "0.5", "0.75", "1")
+    ),
+    column_gap = unit(0.5, "cm"),   # Increase gap between SI_mean groups
+    cluster_columns = FALSE,
+    cluster_rows = FALSE,
+    use_raster = TRUE
+  )
+  
+  ## 13. Save the heatmaps as PNG files in the EDA folder.
+  png(filename = "../figures/EDA/Daily_Fitbit_Overall_Average.png", width = 1200, height = 900)
+  draw(heatmap_daily, merge_legend = TRUE,
+       heatmap_legend_side = "right", annotation_legend_side = "right")
+  dev.off()
+  
+  png(filename = "../figures/EDA/Sleep_Fitbit_Overall_Average.png", width = 1200, height = 900)
+  draw(heatmap_sleep, merge_legend = TRUE,
+       heatmap_legend_side = "right", annotation_legend_side = "right")
+  dev.off()
+}
+
+# Example usage:
+generate_time_series_heatmap(daily_data_cleaned, sleep_data_cleaned, survey_data_cleaned)
+
+```
+

@@ -1,0 +1,19 @@
+# Ignore all files in the data folder
+data/*
+
+# But keep the folder itself
+!data/.gitkeep
+
+
+
+# Common other ignores
+__pycache__/
+*.pyc
+*.ipynb_checkpoints
+.Rhistory
+.RData
+.env
+DL_py_env/
+
+
+

@@ -1,0 +1,469 @@
+```{r}
+library(tidyverse)      # data wrangling and plotting
+library(ComplexHeatmap) # View model performance
+library(circlize)       # colors for heatmaps
+library(stringr)
+
+# Models Directories
+CNN_DIR <- "../CNN/results"
+LSTM_DIR <- "../LSTM/results"
+OLS_DIR <- "../OLS/results"
+
+PLOTS_DIR <- "../../figures/modeling/val_forest_plots"
+
+#shap
+# "../OLS/SHAP"
+# "../CNN/results"
+# "../LSTM/results"
+```
+
+# Import OLS
+```{r}
+OLS_reg <- read_tsv(paste0(OLS_DIR, "/reg_perf.tsv"), show_col_types = F)
+
+OLS_reg <- OLS_reg %>% 
+  mutate(
+    Data = ifelse(str_detect(model ,"^fit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "_nw_"), "No Weight", "Weight"),
+    Model = ifelse(str_detect( model, "nonen"), "LR", "Elastic Net LR")) %>% 
+  mutate(
+    Data = factor(Data, levels = c("fitbit", "comb")),
+    Weight = factor(Weight, levels = c("No Weight", "Weight")),
+    Model = factor(Model, levels = c("LR", "Elastic Net LR")),
+    type = factor(type, levels = c("train", "test"))
+    ) %>% select(-model) %>% arrange(Data, Model, Weight, type)
+
+```
+
+# Import CNN reg
+```{r}
+CNN_best_reg <- read_tsv(paste0(CNN_DIR, "/best_perf_reg.tsv"), show_col_types = F)
+CNN_base_reg <- read_tsv(paste0(CNN_DIR, "/reg_base_learner.tsv"), show_col_types = F)
+
+CNN_base_reg <- CNN_base_reg %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "weighted"), "Weight", "No Weight"),
+    Model = "CNN base") %>% select(-model) %>% rename(type = data)
+
+CNN_best_reg <-  CNN_best_reg %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "nw"), "No Weight", "Weight"),
+    Model = "CNN best") %>% select(-model)
+
+
+CNN_reg <- rbind(CNN_base_reg, CNN_best_reg)
+
+CNN_reg <- CNN_reg %>% 
+  mutate(
+    Data = factor(Data, levels = c("fitbit", "comb")),
+    Weight = factor(Weight, levels = c("No Weight", "Weight")),
+    Model = factor(Model, levels = c("CNN base", "CNN best")),
+    type = factor(type, levels = c("train", "test"))
+  ) %>% arrange(Data, Model, Weight, type)
+
+```
+
+# Import LSTM reg
+```{r}
+LSTM_best_reg <- read_tsv(paste0(LSTM_DIR, "/best_perf_reg.tsv"), show_col_types = F)
+LSTM_base_reg <- read_tsv(paste0(LSTM_DIR, "/reg_base_learner.tsv"), show_col_types = F)
+
+LSTM_base_reg <- LSTM_base_reg %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "weighted"), "Weight", "No Weight"),
+    Model = "LSTM base") %>% select(-model) %>% rename(type = data)
+
+LSTM_best_reg <-  LSTM_best_reg %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "nw"), "No Weight", "Weight"),
+    Model = "LSTM best") %>% select(-model)
+
+
+LSTM_reg <- rbind(LSTM_base_reg, LSTM_best_reg)
+
+LSTM_reg <- LSTM_reg %>% 
+  mutate(
+    Data = factor(Data, levels = c("fitbit", "comb")),
+    Weight = factor(Weight, levels = c("No Weight", "Weight")),
+    Model = factor(Model, levels = c("LSTM base", "LSTM best")),
+    type = factor(type, levels = c("train", "test"))
+  ) %>% arrange(Data, Model, Weight, type)
+```
+
+
+```{r}
+make_custom_heatmap <- function(df, column_title, file_name = NULL,
+                                group_fontface = "bold", group_fontsize = 12,
+                                row_names_fontface = "bold", row_names_fontsize = 14,
+                                cell_text_fontsize = 12, 
+                                top_anno_fontsize = 10,
+                                legend_fontsize = 13) {
+
+  # Check for required columns.
+  required_cols <- c("type", "1", "2", "3", "4", "5", "overall", "Data", "Weight", "Model")
+  missing_cols <- setdiff(required_cols, colnames(df))
+  if(length(missing_cols) > 0) {
+    stop(paste("Missing columns in dataframe:", paste(missing_cols, collapse = ", ")))
+  }
+  
+  # Create a numeric matrix from the SI_mean values (columns "1", "2", "3", "4", "5", "overall").
+  mat <- as.matrix(df[, c("1", "2", "3", "4", "5", "overall")])
+  
+  # Set row names from the "type" column (i.e. "train" or "test").
+  rownames(mat) <- df$type
+  
+  # Define hierarchical row splitting:
+  #   First, split by the "Data" column (e.g. "fitbit", "comb").
+  #   Then, split by the "Model" column (e.g. "LR", "Elastic Net LR").
+  row_split_list <- list(
+    Data = factor(df$Data),
+    Model = factor(df$Model)
+  )
+  
+  # Create a row annotation for Weight with a vertical color bar.
+  weight_colors <- c("Weight" = "red", "No Weight" = "blue")
+  row_ann <- rowAnnotation(
+    Weight = df$Weight,
+    col = list(Weight = weight_colors),
+    annotation_legend_param = list(
+      Weight = list(
+        title = "Weight",
+        title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+        labels_gp = gpar(fontsize = legend_fontsize)
+      )
+    )
+  )
+  
+  # Create a top column annotation showing SI_mean column names.
+  col_names <- colnames(mat)
+  # Set default column colors if there are exactly 6 numeric columns.
+  if(length(col_names) == 6) {
+    col_colors <- c("blue", "green", "yellow", "orange", "red", "gray")
+  } else {
+    col_colors <- rainbow(length(col_names))
+  }
+  names(col_colors) <- col_names
+  
+  col_anno <- HeatmapAnnotation(
+    SI_mean = col_names,
+    col = list(SI_mean = col_colors),
+    border = TRUE,
+    annotation_legend_param = list(
+      SI_mean = list(
+        title = "SI_mean", 
+        at = col_names, 
+        labels = col_names,
+        title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+        labels_gp = gpar(fontsize = legend_fontsize)
+      )
+    ),
+    annotation_name_gp = gpar(fontsize = top_anno_fontsize, fontface = "bold")
+  )
+  
+  # Create a fixed color mapping function.
+  # (Here the function maps values 0, 3, and 5 to blue, white, and red respectively.)
+  col_fun <- colorRamp2(c(0, 3, 5), c("blue", "white", "red"))
+  
+  # Helper function to choose a contrasting text color.
+  get_contrast_color <- function(bg) {
+    rgb <- col2rgb(bg)
+    brightness <- (0.299 * rgb[1] + 0.587 * rgb[2] + 0.114 * rgb[3])
+    if(brightness < 80) "white" else "black"
+  }
+  
+  # Build the heatmap.
+  ht <- Heatmap(
+    mat,
+    name = "SI_mean",
+    col = col_fun,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_names_gp = gpar(fontface = row_names_fontface, fontsize = row_names_fontsize),
+    show_column_names = FALSE,  # We use a custom column annotation.
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    rect_gp = gpar(col = "black", lwd = 1),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      # Determine an appropriate text color to contrast with the cell fill.
+      contrast_color <- get_contrast_color(fill)
+      grid.text(sprintf("%.2f", mat[i, j]), x, y, 
+                gp = gpar(col = contrast_color, fontsize = cell_text_fontsize))
+    },
+    row_split = row_split_list,
+    row_title_side = "left",  # Row split labels on the left.
+    row_title_rot = 0,        # Horizontal split labels.
+    row_title_gp = gpar(fontface = group_fontface, fontsize = group_fontsize),
+    top_annotation = col_anno,
+    left_annotation = row_ann,  # Add the vertical Weight color bar.
+    column_title = column_title,
+    border_gp = gpar(col = "black"),
+    column_title_gp = gpar(fontsize = 16, fontface = "bold"),
+    heatmap_legend_param = list(
+      title = "SI_mean", 
+      at = c(0, 1, 2, 3, 4, 5),
+      labels = c(0, 1, 2, 3, 4, 5),
+      title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+      labels_gp = gpar(fontsize = legend_fontsize)
+    )
+  )
+  
+  
+  
+  # Draw and optionally save the heatmap.
+  if (!is.null(file_name)) {
+    file_name <- paste0(PLOTS_DIR, "/", file_name, ".png")
+    png(file_name, width = 1200, height = 1000, res = 150)
+    draw(ht, heatmap_legend_side = "right", merge_legend = TRUE)
+    dev.off()
+    draw(ht, heatmap_legend_side = "right", merge_legend = TRUE)
+  } else {
+    draw(ht, heatmap_legend_side = "right", merge_legend = TRUE)
+  }
+}
+
+## ----------------------------------------------------------------------------
+## Example usage:
+##
+## Assume your dataframe is named 'df' and has the following columns:
+## "type"       : Train/Test labels ("train", "test")
+## "1" - "5"    : Numeric SI_mean values
+## "overall"    : A numeric column (if to be shown along with 1-5)
+## "Data"       : Data source (e.g., "fitbit", "comb")
+## "Weight"     : Weight designation ("Weight" or "No Weight")
+## "Model"      : Model type (e.g., "LR", "Elastic Net LR")
+##
+## For example, if your dataframe is already loaded into 'df':
+##
+## column_title <- "Custom SI_mean Heatmap"
+## file_name <- "custom_heatmap.png"  # Set to NULL if you just want to display
+## make_custom_heatmap(df, column_title, file_name)
+
+make_custom_heatmap(OLS_reg, "Linear Regression", "LR_reg")
+make_custom_heatmap(CNN_reg, "CNN Regression", "CNN_reg")
+make_custom_heatmap(LSTM_reg, "LSTM Regression", "LSTM_reg")
+```
+# Import Logistic
+```{r}
+OLS_class  <- read_tsv(paste0(OLS_DIR, "/class_perf.tsv"), show_col_types = F)
+
+OLS_class <- OLS_class %>% 
+  mutate(
+    Data = ifelse(str_detect(model ,"^fit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "_nw_"), "No Weight", "Weight"),
+    Model = ifelse(str_detect( model, "nonen"), "LR", "Elastic Net LR")) %>% 
+  mutate(
+    Data = factor(Data, levels = c("fitbit", "comb")),
+    Weight = factor(Weight, levels = c("No Weight", "Weight")),
+    Model = factor(Model, levels = c("LR", "Elastic Net LR")),
+    type = factor(type, levels = c("train", "test"))
+    ) %>% 
+  select(-c(model, AUC)) %>% 
+  arrange(Data, Model, Weight, type) %>% 
+  rename(
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    Specificity = specificity
+    
+    )
+
+
+```
+
+# Import CNN class
+```{r}
+CNN_best_class <- read_tsv(paste0(CNN_DIR, "/best_perf_class.tsv"), show_col_types = F)
+CNN_base_class <- read_tsv(paste0(CNN_DIR, "/class_base_learner.tsv"), show_col_types = F)
+
+CNN_base_class <- CNN_base_class %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "weighted"), "Weight", "No Weight"),
+    Model = "CNN base") %>% select(-model) %>% rename(type = data)
+
+CNN_best_class <-  CNN_best_class %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "nw"), "No Weight", "Weight"),
+    Model = "CNN best") %>% select(-model)
+
+
+CNN_class <- rbind(CNN_base_class, CNN_best_class)
+
+CNN_class <- CNN_class %>% 
+  mutate(
+    Data = factor(Data, levels = c("fitbit", "comb")),
+    Weight = factor(Weight, levels = c("No Weight", "Weight")),
+    Model = factor(Model, levels = c("CNN base", "CNN best")),
+    type = factor(type, levels = c("train", "test"))
+  ) %>% arrange(Data, Model, Weight, type) %>% rename(
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    Specificity = specificity
+    ) %>% select(-c(AUC))
+
+```
+
+# Import LSTM class
+```{r}
+LSTM_best_class <- read_tsv(paste0(LSTM_DIR, "/best_perf_class.tsv"), show_col_types = F)
+LSTM_base_class <- read_tsv(paste0(LSTM_DIR, "/class_base_learner.tsv"), show_col_types = F)
+
+LSTM_base_class <- LSTM_base_class %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "weighted"), "Weight", "No Weight"),
+    Model = "LSTM base") %>% select(-model) %>% rename(type = data)
+
+LSTM_best_class <-  LSTM_best_class %>% 
+  mutate(
+    Data = ifelse(str_detect(model, "^fitbit"), "fitbit", "comb"),
+    Weight = ifelse(str_detect(model, "nw"), "No Weight", "Weight"),
+    Model = "LSTM best") %>% select(-model)
+
+
+LSTM_class <- rbind(LSTM_base_class, LSTM_best_class)
+
+LSTM_class <- LSTM_class %>% 
+  mutate(
+    Data = factor(Data, levels = c("fitbit", "comb")),
+    Weight = factor(Weight, levels = c("No Weight", "Weight")),
+    Model = factor(Model, levels = c("LSTM base", "LSTM best")),
+    type = factor(type, levels = c("train", "test"))
+  ) %>% arrange(Data, Model, Weight, type) %>% rename(
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    Specificity = specificity
+    ) %>% select(-c(AUC)) 
+```
+
+
+# Classifcation
+```{r}
+make_metric_heatmap <- function(df, column_title, file_name = NULL,
+                                group_fontface = "bold", group_fontsize = 12,
+                                row_names_fontface = "bold", row_names_fontsize = 14,
+                                cell_text_fontsize = 12,
+                                legend_fontsize = 13) {
+
+
+  required_cols <- c("type", "Accuracy", "Sensitivity", "Specificity", "Data", "Weight", "Model")
+  missing_cols <- setdiff(required_cols, colnames(df))
+  if(length(missing_cols) > 0) {
+    stop(paste("Missing columns:", paste(missing_cols, collapse = ", ")))
+  }
+
+  # Reorder rows
+  df$Weight <- factor(df$Weight, levels = c("No Weight", "Weight"))
+  df$type   <- factor(df$type, levels = c("train", "test"))
+  df <- df[order(df$Data, df$Model, df$Weight, df$type), ]
+
+  # Extract matrix
+  mat <- as.matrix(df[, c("Accuracy", "Sensitivity", "Specificity")])
+  rownames(mat) <- df$type
+
+  # Row splits
+  row_split_list <- list(
+    Data = factor(df$Data),
+    Model = factor(df$Model)
+  )
+
+  # Row annotation
+  weight_colors <- c("Weight" = "red", "No Weight" = "blue")
+  row_ann <- rowAnnotation(
+    Weight = df$Weight,
+    col = list(Weight = weight_colors),
+    annotation_legend_param = list(
+      Weight = list(
+        title = "Weight",
+        title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+        labels_gp = gpar(fontsize = legend_fontsize)
+      )
+    )
+  )
+
+  # Color scale: center at 0.5
+  col_fun <- colorRamp2(c(0, 0.5, 1), c("blue", "white", "red"))
+
+  # Text contrast helper
+  get_contrast_color <- function(bg) {
+    rgb <- col2rgb(bg)
+    brightness <- (0.299 * rgb[1] + 0.587 * rgb[2] + 0.114 * rgb[3])
+    if(brightness < 80) "white" else "black"
+  }
+
+  # Heatmap
+  ht <- Heatmap(
+    mat,
+    name = "Metric",
+    col = col_fun,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_names_gp = gpar(fontface = row_names_fontface, fontsize = row_names_fontsize),
+    show_column_names = TRUE,
+    column_names_side = "top",          # ⬅️ Move labels to the top
+    column_names_rot = 0,               # ⬅️ Horizontal orientation
+    column_names_centered = T,
+    column_names_gp = gpar(fontsize = 12, fontface = "bold"),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    rect_gp = gpar(col = "black", lwd = 1),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      contrast_color <- get_contrast_color(fill)
+      grid.text(sprintf("%.2f", mat[i, j]), x, y, 
+                gp = gpar(col = contrast_color, fontsize = cell_text_fontsize))
+    },
+    row_split = row_split_list,
+    row_title_side = "left",
+    row_title_rot = 0,
+    row_title_gp = gpar(fontface = group_fontface, fontsize = group_fontsize),
+    left_annotation = row_ann,
+    column_title = column_title,
+    column_title_gp = gpar(fontsize = 16, fontface = "bold"),
+    column_title_side = "top",
+    border_gp = gpar(col = "black"),
+    heatmap_legend_param = list(
+      title = "Metric",
+      at = seq(0, 1, 0.25),
+      labels = seq(0, 1, 0.25),
+      title_gp = gpar(fontface = "bold", fontsize = legend_fontsize),
+      labels_gp = gpar(fontsize = legend_fontsize)
+    )
+  )
+
+
+  # Draw or save with spacing above column labels
+  if (!is.null(file_name)) {
+    file_name <- paste0(PLOTS_DIR, "/", file_name, ".png")
+    png(file_name, width = 1200, height = 1000, res = 150)
+    draw(ht,
+         heatmap_legend_side = "right",
+         merge_legend = TRUE,
+         padding = unit(c(20, 5, 5, 5), "pt")  # Top, right, bottom, left
+    )
+    dev.off()
+    draw(ht,
+     heatmap_legend_side = "right",
+     merge_legend = TRUE,
+     padding = unit(c(20, 5, 5, 5), "pt")  # Top, right, bottom, left
+    )
+  } else {
+    draw(ht,
+         heatmap_legend_side = "right",
+         merge_legend = TRUE,
+         padding = unit(c(20, 5, 5, 5), "pt")
+    )
+  }
+}
+
+
+make_metric_heatmap(OLS_class, "Logistic Regression", "log_reg")
+make_metric_heatmap(CNN_class, "CNN Classifcation", "CNN_class")
+make_metric_heatmap(LSTM_class, "LSTM Classifcation", "LSTM_class")
+
+```
+
+

@@ -1,0 +1,65 @@
+```{r}
+library(tidyverse)      # data wrangling and plotting
+library(stringr)        # for string manipulation
+
+# Models Directories
+CNN_DIR <- "../CNN/results"
+LSTM_DIR <- "../LSTM/results"
+OLS_DIR <- "../OLS/results"
+
+PLOTS_DIR <- "../../figures/modeling/shap_scores"
+
+```
+
+# Helpers
+```{r}
+clean_shap <- function(df){
+  df <- df %>% 
+    rename(
+      mean = mean_abs_integrated_gradients,
+      sd = sd_abs_integrated_gradients
+    ) %>% 
+    filter(mean >=0) %>% 
+    arrange(desc(mean))
+  
+  return(df)
+}
+```
+
+
+```{r}
+LSTM_fitbit_shap <- read_tsv(paste0(LSTM_DIR, "/shap_fitbit_reg.tsv"), show_col_types = F) %>% clean_shap()
+LSTM_comb_shap <- read_tsv(paste0(LSTM_DIR, "/shap_comb_reg.tsv"), show_col_types = F) %>% clean_shap()
+
+```
+
+```{r, fig.width=8.5, fig.height=7}
+plot_shap_forest <- function(df, file_name = "forest_plot.png", plot_title = "Forest Plot") {
+  # Load required package
+  library(ggplot2)
+  
+  # Optionally, reverse the order of the predictor factor to have the first row on top.
+  # This assumes you want the predictors ordered as in the data.
+  df$predictor <- factor(df$predictor, levels = rev(unique(df$predictor)))
+  
+  # Create the plot using ggplot2. The points represent the means and the error bars represent (mean ± sd).
+  p <- ggplot(df, aes(x = mean, y = predictor)) +
+    geom_point(size = 3) +
+    geom_errorbarh(aes(xmin = mean - sd, xmax = mean + sd), height = 0.2) +
+    labs(title = plot_title, x = "Mean (± SD)", y = "Predictor") +
+    theme_minimal(base_size = 13)
+  
+  # Save the plot to file.
+  file_path <- file.path(PLOTS_DIR, paste0(file_name, ".png"))
+  ggsave(filename = file_path, plot = p, width = 8.5, height = 7, dpi = 300, units="in")
+  
+  # Return the plot object.
+  return(p)
+}
+
+
+plot_shap_forest(LSTM_fitbit_shap, file_name = "LSTM_fitbit_SHAP_scores", plot_title = "LSTM fitbit SHAP scores")
+plot_shap_forest(LSTM_comb_shap, file_name = "LSTM_comb_SHAP_scores", plot_title = "LSTM comb SHAP scores")
+
+```
+

@@ -1,0 +1,378 @@
+```{r}
+library(tidyverse)        # For Generic data wrangling
+library(data.table)       # For efficient data wrangling
+library(lubridate)        # For working with date times
+library(naniar)           # For MCAR test
+library(mice)             # For conditional mean imputation (daily data)
+library(DirichletReg)     # For imputing sleep data
+
+setwd("/home/jeffrw/BIOSTAT629/main_project/preprocessing")
+
+## DATA FILE LOCATIONS
+# "../data/raw/Fitbit_sleep"
+# "../data/raw/Survey_data"
+# "../data/raw/Fitbit_Daily.txt"
+# survey_data_o <- load_data("../data/raw/Survey_data")
+```
+
+
+# Survey Data
+```{r}
+load_data <- function(dir){
+  # Helper function to load in data set and append headers
+  header_file <- paste0(dir, ".rpt")
+  headers <- readLines(header_file, n = 1)
+  
+  headers <- strsplit(headers, "\\s+") %>% unlist()
+  
+  data_file <- paste0(dir, ".txt")
+  data <- read.table(data_file, sep="\t", header=F)
+  
+  colnames(data) <- headers
+  
+  return(data)
+}
+
+survey_data_o <- load_data("../data/raw/Survey_data")
+
+
+```
+
+
+
+# Fitbit Daily data
+```{r}
+## DATA FILE LOCATIONS
+# "../data/raw/Fitbit_sleep"
+# "../data/raw/Survey_data"
+# "../data/raw/Fitbit_Daily.txt"
+daily_data_o <- load_data("../data/raw/Fitbit_Daily")
+```
+
+
+```{r}
+# Remove ModifiedDate column
+daily_data <- daily_data_o %>% select(-ModifiedDate)
+
+
+# Convert to data.table for performance boost
+setDT(daily_data)
+
+# Process Date column efficiently
+daily_data[, Date := as.Date(ymd_hms(Date))]  # Convert Date to day-level format
+
+# Identify columns to convert (excluding ID & Date)
+cols_to_convert <- setdiff(names(daily_data), c("PatientID", "Date"))
+
+# Efficiently replace "NULL" (anywhere in the string) with NA and convert to numeric
+daily_data[, (cols_to_convert) := lapply(.SD, function(x) {
+  x[x %in% c("NULL", "null")] <- NA  # Convert "NULL" or "null" to NA
+  as.numeric(x)  # Convert the column to numeric
+}), .SDcols = cols_to_convert]
+
+# Remove columns with more than 30% missing values
+na_proportion <- colMeans(is.na(daily_data))
+cols_to_keep <- names(na_proportion[na_proportion <= 0.3])
+daily_data <- daily_data[, ..cols_to_keep]
+
+# Create lookup vectors for start_date and end_date
+start_dates <- survey_data$start_date[match(daily_data$PatientID, survey_data$PatientID)]
+end_dates <- survey_data$end_date[match(daily_data$PatientID, survey_data$PatientID)]
+
+# Filter daily_data using vectorized lookup without joins
+daily_data <- daily_data[
+  !is.na(start_dates) & !is.na(end_dates) &  # Ensure the patient exists in survey_data
+  Date >= start_dates & Date <= end_dates
+]
+
+# Group by PatientID and Date, then compute mean (fast aggregation)
+daily_data <- daily_data[, lapply(.SD, mean, na.rm = TRUE), by = .(PatientID, Date)]
+
+# Order by PatientID and Date
+setorder(daily_data, PatientID, Date)
+
+
+mcar_test_daily <- daily_data %>% select(-PatientID, Date)
+# Test for MCAR
+gg_miss_upset(mcar_test_daily)
+
+
+# ?TestMCARNormality
+
+daily_data %>% is.na() %>% apply(2, sum)
+```
+# Check percentage total missing per subject among the 5 variables.
+```{r}
+check_missing <- function(){
+  # Define the five variables of interest
+  missing_vars <- c("HeartRateZoneFatBurnMinutes", 
+                    "HeartRateZoneCardioCaloriesOut", 
+                    "HeartRateZoneCardioMinutes", 
+                    "HeartRateZonePeakCaloriesOut", 
+                    "HeartRateZonePeakMinutes")
+  
+  # Create a new column indicating if all five variables are missing in a row
+  daily_data[, all_missing := rowSums(is.na(.SD)) == length(missing_vars), .SDcols = missing_vars]
+  
+  # Compute the percentage of missing records per subject
+  subject_missing_summary <- daily_data[, .(
+    all_missing_count = sum(all_missing),  # Count of fully missing rows
+    total_records = .N,  # Total records per subject
+    percentage_missing = (sum(all_missing) / .N) * 100  # Percentage missing
+  ), by = PatientID]
+  
+  mean(subject_missing_summary$percentage_missing > 50)
+}
+
+check_missing()
+```
+
+# impute the missing data for daily
+```{r}
+# Step 1: Make a copy of your data.table
+dt <- copy(daily_data)
+
+# Step 2: Exclude PatientID and Date from the imputation
+cols_to_impute <- setdiff(names(dt), c("PatientID", "Date"))
+impute_data <- dt[, ..cols_to_impute]
+
+# Step 3: Remove constant and collinear columns
+cols_to_remove <- c(
+  "HeartRateZoneOutOfRangeMin",
+  "HeartRateZonePeakMax",
+  "HeartRateZoneFatBurnMin",
+  "HeartRateZoneCardioMin",
+  "HeartRateZonePeakMin",
+  "TrackerCalories",
+  "TrackerFloors"
+)
+impute_data <- impute_data[, !cols_to_remove, with = FALSE]
+
+# Step 4: Run `mice` with `pmm`, multiple imputations (`m = 5`) for averaging
+imp <- mice(impute_data, method = "pmm", m = 5, seed = 123, print = T)
+
+# Step 5: Extract all imputed datasets and compute the mean across imputations
+imputed_list <- lapply(1:5, function(i) complete(imp, i))  # Extract all imputed datasets
+imputed_data_set <- Reduce("+", imputed_list) / 5  # Compute element-wise mean
+
+# Step 6: Reattach PatientID and Date
+imputed_data_set <- cbind(dt[, .(PatientID, Date)], imputed_data_set)
+
+# Step 7: Print number of missing values per column (should be all 0)
+colSums(is.na(imputed_data_set))
+
+```
+
+
+# aggregate non-imputed and get skipped
+```{r}
+# Group by PatientID and Date, then compute mean (fast aggregation)
+daily_data <- daily_data[, lapply(.SD, mean, na.rm = TRUE), by = .(PatientID, Date)]
+
+# Add 'skipped' column: if any rows are NA, 1 otheriswe 0.
+data_cols <- setdiff(names(daily_data), c("PatientID", "Date"))
+daily_data[, skipped := fifelse(rowSums(is.na(.SD)) > 0, 1, 0), .SDcols = data_cols]
+```
+
+# aggregate imputed and append skipped by PatientID and Date
+```{r}
+# Define columns to aggregate (exclude PatientID and Date)
+data_cols <- setdiff(names(daily_data_imputed), c("PatientID", "Date"))
+
+# Perform mean aggregation per PatientID and Date
+daily_data_imputed_agg <- daily_data_imputed[, lapply(.SD, mean, na.rm = TRUE), by = .(PatientID, Date), .SDcols = data_cols]
+
+# Perform a left join to bring in the 'skipped' column from daily_data
+daily_data_imputed_agg <- merge(daily_data_imputed_agg, 
+                                daily_data[, .(PatientID, Date, skipped)], 
+                                by = c("PatientID", "Date"), 
+                                all.x = TRUE)
+
+daily_data_imputed_agg %>% is.na() %>% apply(2, mean)
+```
+
+
+# Fitbit Sleep
+```{r}
+## DATA FILE LOCATIONS
+# "../data/raw/Fitbit_sleep"
+# "../data/raw/Survey_data"
+# "../data/raw/Fitbit_Daily.txt"
+sleep_data_o <- load_data("../data/raw/Fitbit_sleep")
+```
+
+# Step 1: Basic modifications
+```{r}
+# Remove unnecessary columns
+sleep_data <- sleep_data_o %>% select(-c(InfoCode, EndDate, Type))
+
+# Convert to data.table
+setDT(sleep_data)
+
+# Convert StartDate to POSIXct and rename to Date
+sleep_data[, StartDate := as.POSIXct(StartDate, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+sleep_data <- sleep_data %>%
+  mutate(Duration = Duration / (60 * 60 * 1000)) %>% 
+  rename(Date = StartDate)
+
+# Ensure Date is in proper format for aggregation
+sleep_data[, Date := as.Date(Date)]
+
+# Check column names
+# colnames(sleep_data)
+
+
+```
+
+# Step 2: convert sleep's vars to numeric, replace NULL with NA
+```{r}
+# Identify sleep stage columns
+sleep_stage_cols <- c("SleepLevelDeep", "SleepLevelLight", "SleepLevelRem", "SleepLevelWake")
+
+# Replace "NULL" (with any whitespace) with NA
+sleep_data[, (sleep_stage_cols) := lapply(.SD, function(x) fifelse(str_detect(x, "^\\s*NULL\\s*$"), NA, x)), .SDcols = sleep_stage_cols]
+
+# Convert sleep stage columns to numeric
+sleep_data[, (sleep_stage_cols) := lapply(.SD, as.numeric), .SDcols = sleep_stage_cols]
+
+# Convert TimeInBed to numeric
+sleep_data[, TimeInBed := as.numeric(TimeInBed)]
+
+# Check missing values
+sapply(sleep_stage_cols, function(col) sum(is.na(sleep_data[[col]])))
+```
+# Step 3: Reshape Data for Dirichlet Regression
+```{r}
+# Convert sleep data into long format
+sleep_long <- sleep_data %>%
+  pivot_longer(cols = all_of(sleep_stage_cols), 
+               names_to = "SleepStage", 
+               values_to = "Minutes")
+
+# Convert SleepStage to a factor
+sleep_long$SleepStage <- factor(sleep_long$SleepStage, levels = sleep_stage_cols)
+
+# Normalize by TimeInBed to get proportions
+sleep_long <- sleep_long %>%
+  mutate(Prop = Minutes / TimeInBed) %>%
+  filter(!is.na(Prop))  # Remove missing values
+```
+
+
+#### LEFT OFF HERE, READ UP ON BAYESEAN MODELING FOR MULTINOMIAL - DIRCHLET
+# Step 4: Fit Dirchelt Multinomial model with informative priors
+```{r}
+# --- Step 4: Dirichlet Regression with Category-Specific Priors ---
+
+# 1. Log-transformed expected proportions for each category (per scientific estimates)
+log_deep  <- log(0.20)   # ~ -1.6094
+log_light <- log(0.50)   # ~ -0.6931
+log_rem   <- log(0.22)   # ~ -1.5141
+log_wake  <- log(0.08)   # ~ -2.5257
+
+# 2. Define a single bf(...) call with mu2, mu3, mu4, and nl=TRUE
+#    - cbind(...) defines the 4-category response.
+#    - mu2 ~ 1, mu3 ~ 1, mu4 ~ 1 sets intercept-only for the 2nd, 3rd, and 4th parameters.
+#    - nl=TRUE tells brms we are manually specifying multiple distributional parameters.
+bf_dir <- bf(
+  cbind(SleepLevelDeep, SleepLevelLight, SleepLevelRem, SleepLevelWake) ~ 1,  # mu1
+  mu2 ~ 1,  # 2nd category (Light)
+  mu3 ~ 1,  # 3rd category (REM)
+  mu4 ~ 1,  # 4th category (Wake)
+  nl = TRUE,           # non-linear formula approach
+  family = dirichlet() # Dirichlet distribution
+)
+
+# 3. Specify your category-specific priors, matching each intercept with dpar="muX"
+#    By default, the first category is mu1, second is mu2, etc.
+my_priors <- c(
+  set_prior(paste0("normal(", log_deep,  ", 0.5)"), class = "Intercept", dpar = "mu1"),  # Deep
+  set_prior(paste0("normal(", log_light, ", 0.5)"), class = "Intercept", dpar = "mu2"),  # Light
+  set_prior(paste0("normal(", log_rem,   ", 0.5)"), class = "Intercept", dpar = "mu3"),  # REM
+  set_prior(paste0("normal(", log_wake,  ", 0.5)"), class = "Intercept", dpar = "mu4"),  # Wake
+
+  # Example: if you have predictors (e.g., Age), put a normal(0,1) prior on them like so:
+  set_prior("normal(0, 1)", class = "b")
+)
+
+# 4. Fit the Dirichlet model using only rows with no missing values in the sleep stage columns
+sleep_model <- brm(
+  bf_dir,
+  data = sleep_data[complete.cases(sleep_data[, ..sleep_stage_cols]), ],
+  prior = my_priors,
+  chains = 4, iter = 5000, warmup = 1000, cores = 4
+)
+
+```
+
+# Step 5: MCMC Diagnostics
+```{r}
+# Check effective sample size (ESS)
+summary(sleep_model)$fixed  
+
+# Check Gelman-Rubin R-hat
+rhat(sleep_model)
+
+# Plot trace plots to assess burn-in
+plot(sleep_model)
+
+
+```
+
+# Step 6: Impute Missing Values
+```{r}
+# Prepare new data for missing predictions
+new_data <- sleep_data[missing_rows, ..predictors]
+
+# Generate posterior predictions
+posterior_samples <- posterior_predict(sleep_model, newdata = new_data)
+
+# Convert posterior proportions to means for imputation
+imputed_proportions <- apply(posterior_samples, c(2,3), mean)
+
+# Assign imputed proportions to missing rows
+sleep_data[missing_rows, (paste0("prop_", sleep_stage_cols)) := as.data.table(imputed_proportions)]
+
+# Convert proportions back to minutes
+sleep_data[missing_rows, (sleep_stage_cols) := lapply(.SD, function(x) x * TimeInBed),
+           .SDcols = paste0("prop_", sleep_stage_cols)]
+
+
+```
+
+# Step 7: # Plot posterior predictive check
+```{r}
+pp_check(sleep_model)
+```
+
+
+```{r}
+# Step 1: Create an indicator column for missing Sleep Levels based on "NULL" strings
+sleep_data[, NoSleepStages := ifelse(
+  SleepLevelDeep == "NULL" & SleepLevelLight == "NULL" & 
+  SleepLevelRem == "NULL" & SleepLevelWake == "NULL", 1, 0)]
+
+# Step 2: Generate a histogram with x-axis showing all integers from 0 to 20
+ggplot(sleep_data, aes(x = Duration, fill = factor(NoSleepStages))) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  scale_x_continuous(breaks = seq(0, 20, by = 1)) +  # Ensures all integers from 0 to 20 are shown
+  labs(
+    title = "Distribution of Sleep Duration vs. No Sleep Stages Indicator",
+    x = "Duration (Hours)",
+    y = "Count",
+    fill = "No Sleep Stages"
+  ) +
+  theme_minimal()
+```
+
+
+
+```{r}
+intersect(
+  intersect(unique(sleep_data$PatientID), unique(daily_data$PatientID)), 
+  unique(survey_data$PatientID)
+) %>% length()
+
+```
+
+

@@ -1,0 +1,248 @@
+```{r}
+library(tidyverse)        # For Generic data wrangling
+library(data.table)       # For efficient data wrangling
+library(lubridate)        # For working with date times
+library(readr)            # For working with tsv
+
+setwd("/home/jeffrw/BIOSTAT629/main_project/preprocessing")
+```
+
+# Helper Functions
+```{r}
+load_data <- function(dir){
+  # Helper function to load in data set and append headers
+  header_file <- paste0(dir, ".rpt")
+  headers <- readLines(header_file, n = 1)
+  
+  headers <- strsplit(headers, "\\s+") %>% unlist()
+  
+  data_file <- paste0(dir, ".txt")
+  data <- read.table(data_file, sep="\t", header=F)
+  
+  colnames(data) <- headers
+  
+  return(data)
+}
+
+```
+
+# Load survey data
+```{r}
+survey_data_o <- load_data("../data/raw/Survey_data")
+# survey_data_o$SurveyQuestion %>% unique()
+
+# survey_data_o$PossibleAnswers %>% unique()
+
+# " AnswerText - Male : AnswerValue - gender1, 
+# AnswerText - Female : AnswerValue - gender2, 
+# AnswerText - Trans male/Trans man : AnswerValue - gender3, 
+# AnswerText - Trans female/Trans woman : AnswerValue - gender4, 
+# AnswerText - Genderqueer/Gender non-conforming : AnswerValue - gender5, 
+# AnswerText - Different identity : AnswerValue - gender6, 
+# AnswerText - Prefer not to answer : AnswerValue - gender7"
+```
+
+# Survey Data Preprocessing
+```{r}
+survey_data <- survey_data_o
+
+## No missing data
+# survey_data %>% apply(., MARGIN=2,FUN = function(x) {sum(is.na(x))})
+
+# Change surveyEndDateQuestion to datetime
+survey_data <- survey_data %>% 
+  mutate(
+    SurveyQuestionEndDate = ymd_hms(SurveyQuestionEndDate),
+    DOB = ymd_hms(DOB)
+    )
+##### EXTRACT DATES
+
+# Extract Survey Baseline Date and DOB
+baseline_date_and_DOB <- survey_data %>% 
+  filter(str_detect(SurveyName, "Baseline")) %>% 
+  group_by(PatientID) %>% 
+  summarize(
+    Baseline_Date = min(SurveyQuestionEndDate),
+    DOB = first(DOB)
+    )
+
+
+# Extract Survey End date(for 6 week)
+end_date <- survey_data %>% 
+  filter(str_detect(SurveyName, "6-Week")) %>% 
+  group_by(PatientID) %>% 
+  summarize(end_date = min(SurveyQuestionEndDate))
+
+##### EXTRACT SURVEY QUESTIONS
+# Extract race
+race_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "race")) %>% 
+  mutate(SurveyAnswer = case_when(
+    SurveyAnswer == "race1" ~ "White",
+    SurveyAnswer == "race2" ~ "Black or African American",
+    SurveyAnswer == "race3" ~ "American Indian/Alaska Native",
+    SurveyAnswer == "race4" ~ "Asian",
+    SurveyAnswer == "race5" ~ "Native Hawaiian or Other Pacific Islander",
+    SurveyAnswer == "race6" ~ "Something else",
+    SurveyAnswer == "race7" ~ "Prefer not to answer"
+  )) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(Race = SurveyAnswer)
+
+# Extract hispanic
+hispanic_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "Hispanic")) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(isHispanic = SurveyAnswer)
+
+# Extract relationship status
+relationship_status_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "relationship status")) %>% 
+  mutate(SurveyAnswer = case_when(
+      SurveyAnswer == "Rel1" ~ "Single",
+      SurveyAnswer == "Rel2" ~ "Married",
+      SurveyAnswer == "Rel3" ~ "In a committed relationship but not married",
+      SurveyAnswer == "Rel4" ~ "Divorced or separated",
+      SurveyAnswer == "Rel5" ~ "Widowed",
+      SurveyAnswer == "Rel6" ~ "Prefer not to answer"
+  )) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(`Relationship_Status` = SurveyAnswer)
+
+# Extract Education
+education_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "highest degree")) %>% 
+  mutate(SurveyAnswer = case_when(
+      SurveyAnswer == "Ed2" ~ "Less than a high school diploma",
+      SurveyAnswer == "Ed3" ~ "High school graduate or GED",
+      SurveyAnswer == "Ed4" ~ "Some college credit, no degree",
+      SurveyAnswer == "Ed5" ~ "Trade/technical/vocational training",
+      SurveyAnswer == "Ed6" ~ "Associate degree",
+      SurveyAnswer == "Ed7" ~ "Bachelor's degree",
+      SurveyAnswer == "Ed8" ~ "Master's degree",
+      SurveyAnswer == "Ed10" ~ "Doctorate degree"
+  )) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(education = SurveyAnswer)
+
+# Extract Employment
+employment_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "employment status")) %>% 
+  mutate(SurveyAnswer = case_when(
+      SurveyAnswer %in% c("3Em1", "1Em1") ~ "Full-time employment",
+      SurveyAnswer %in% c("3Em2", "1Em2") ~ "Part-time employment",
+      SurveyAnswer %in% c("3Em3", "1Em3") ~ "Student",
+      SurveyAnswer %in% c("3Em4", "1Em7") ~ "Retired",
+      SurveyAnswer %in% c("1Em4", "1Em5", "1Em6") ~ "Unemployed"
+  )) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(employment = SurveyAnswer)
+
+# Extract Sex
+sex_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "sex")) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(sex = SurveyAnswer)
+
+# Extract Current Gender
+gender_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "current gender")) %>% 
+  mutate(SurveyAnswer = case_when(
+      SurveyAnswer == "gender1" ~ "Male",
+      SurveyAnswer == "gender2" ~ "Female",
+      SurveyAnswer == "gender3" ~ "Trans male",
+      SurveyAnswer == "gender4" ~ "Trans female",
+      SurveyAnswer %in% c("gender5", "gender6") ~ "Non-binary",
+      SurveyAnswer == "gender7" ~ "Prefer not to answer"
+  )) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(gender = SurveyAnswer)
+
+# Extract Sexuality
+sexuality_q <- survey_data %>% 
+  filter(str_detect(SurveyQuestion, "Do you think of yourself")) %>% 
+  mutate(SurveyAnswer = case_when(
+      SurveyAnswer == "sexo1" ~ "Bisexual",
+      SurveyAnswer == "sexo2" ~ "Gay or lesbian",
+      SurveyAnswer == "sexo3" ~ "Heterosexual",
+      SurveyAnswer == "sexo4" ~ "Something else",
+      SurveyAnswer == "sex05" ~ "Prefer not to answer"
+  )) %>% 
+  group_by(PatientID) %>% 
+  slice_min(order_by = SurveyQuestionEndDate, n=1, with_ties = F) %>% 
+  ungroup() %>% 
+  select(PatientID, SurveyAnswer) %>% 
+  rename(sexuality = SurveyAnswer)
+
+# Aggregate 6-week
+end_date_aggregate<- survey_data %>%
+  filter(str_detect(SurveyQuestion, "killing yourself")) %>% 
+  group_by(PatientID) %>% 
+  summarize(SI_max = max(as.numeric(SurveyAnswer)), SI_mean = mean(as.numeric(SurveyAnswer)))
+
+
+# List of data frames to join
+data_list <- list(
+  baseline_date_and_DOB, 
+  end_date, 
+  race_q, 
+  hispanic_q, 
+  relationship_status_q, 
+  education_q, 
+  employment_q, 
+  sex_q, 
+  gender_q, 
+  sexuality_q, 
+  end_date_aggregate
+)
+
+# Perform inner join across all data frames using reduce()
+survey_data <- reduce(data_list, inner_join, by = "PatientID") %>% 
+    mutate(
+    Weeks_Difference = as.numeric(difftime(end_date, Baseline_Date, units = "days")) / 7
+  ) %>%
+  filter(Weeks_Difference >= 5.5)
+
+# Ensure survey_data is a data.table
+setDT(survey_data)
+
+# Convert end_date to Date format and subtract 1 day
+survey_data[, end_date := as.Date(end_date) - days(1)]
+
+# Compute start_date (38 days before the adjusted end_date)
+survey_data[, start_date := as.Date(end_date - days(38))]
+
+# Calculate Age based on start_data
+survey_data[, age := as.integer(interval(DOB, start_date) / years(1))]
+
+# Remove DOB
+survey_data <- survey_data %>% select(-DOB)
+```
+
+
+# Save survey data
+```{r}
+write_tsv(survey_data, "../data/intermediate/survey_data.tsv")
+```
+
