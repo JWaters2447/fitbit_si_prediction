@@ -27,15 +27,15 @@ This project was completed as part of my graduate coursework (BIOSTAT 629) at th
 ## Project Structure
 
 ```
-
-├── data/             # [Excluded] Raw data directory (subject-protected)
-├── SQL_extraction/   # SQL scripts for pulling data from the Yottabyte platform
 ├── EDA/              # Exploratory data analysis (R and Python)
-├── preprocessing/    # Data cleaning, imputation, feature engineering
+├── SQL_extraction/   # SQL scripts for pulling data from the Yottabyte platform
+├── data/             # [Excluded] Raw data directory (subject-protected)
+├── figures/          # Plots for EDA, modeling and demographic table
 ├── modeling/         # Main model code (OLS, CNN, LSTM subfolders)
 │   ├── OLS/	        # OLS modeling
 │   ├── CNN/            # CNN modeling
 │   ├── LSTM/           # LSTM modeling
+├── preprocessing/    # Data cleaning, imputation, feature engineering
 
 ```
 
